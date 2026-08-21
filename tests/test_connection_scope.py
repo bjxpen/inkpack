@@ -150,8 +150,8 @@ def test_get_bytes_reads_config_once(repo, monkeypatch, connect_counter):
 def test_verify_on_read_toggled_via_config_set(repo):
     put = repo.store.put_bytes(b"toggle-me", profile="raw").result
     repo.backend.config_set("verify_on_read", True)
-    set_payload(repo, put.ref, b"tampered-bytes")
+    set_payload(repo, put.ref, b"toggled!!")  # same length, different content
     with pytest.raises(CorruptContent):
         repo.store.get_bytes(put.ref)
     repo.backend.config_set("verify_on_read", False)
-    assert repo.store.get_bytes(put.ref) == b"tampered-bytes"  # no identity check
+    assert repo.store.get_bytes(put.ref) == b"toggled!!"  # no identity check

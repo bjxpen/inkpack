@@ -127,19 +127,28 @@ def test_decode_uses_stored_encoding_metadata_not_profile(repo):
 def test_verify_on_read_detects_tamper(tmp_path):
     repo = make_repo(tmp_path, "sqlite_single", verify_on_read=True)
     put = repo.store.put_bytes(b"tamper-me", profile="raw").result
-    set_payload(repo, put.ref, b"different-bytes")
+    set_payload(repo, put.ref, b"tampered!")  # same length, different content
     with pytest.raises(CorruptContent):
         repo.store.get_bytes(put.ref)
 
 
 def test_verify_on_read_default_off(repo):
     put = repo.store.put_bytes(b"tamper-me", profile="raw").result
-    set_payload(repo, put.ref, b"different-bytes")
-    # No verify_on_read => tampered bytes are returned as-is...
-    assert repo.store.get_bytes(put.ref) == b"different-bytes"
+    set_payload(repo, put.ref, b"tampered!")  # same length, different content
+    # No verify_on_read => same-length tampered bytes are returned as-is...
+    assert repo.store.get_bytes(put.ref) == b"tampered!"
     # ...and verify() is what catches it.
     verify = repo.store.verify().result
     assert verify.corrupt == 1
+
+
+def test_codec_none_length_mismatch_is_corrupt(repo):
+    """Locked semantics S3: a codec='none' payload whose length differs from
+    the blob_key's raw_len is corrupt even without verify_on_read."""
+    put = repo.store.put_bytes(b"tamper-me", profile="raw").result
+    set_payload(repo, put.ref, b"different-length-bytes")
+    with pytest.raises(CorruptContent):
+        repo.store.get_bytes(put.ref)
 
 
 def test_put_stream_then_gc_then_missing(repo):

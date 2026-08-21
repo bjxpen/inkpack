@@ -147,11 +147,14 @@ result = op.result                               # after completion
 
 Operations are single-use: iterate once (or just read `.result`).
 
-`op.close()` abandons an operation early and **immediately** releases its
-resources (e.g. the operation-scoped database session) instead of waiting for
-garbage collection; `.result` afterwards raises `Cancelled`. Stream puts
-(`put_stream`, `upsert_chapter_stream`) emit `progress` events **live** while
-the source stream is being hashed.
+Abandonment is **deterministic** (locked semantics S1): `op.close()`, the
+`with op:` context manager, or discarding the iterator prevents an unstarted
+operation from running, releases its resources immediately (no waiting for
+garbage collection), and makes `.result` raise `Cancelled`. A completed
+operation keeps its result; `.result` never returns `None` as a stand-in.
+Stream puts (`put_stream`, `upsert_chapter_stream`) emit `progress` events
+**live** while the source stream is being hashed — and the identity is
+computed exactly once (the spooled bytes are never re-hashed).
 
 ### Operation reference
 
@@ -243,9 +246,11 @@ Unknown option keys, or `profile` combined with `codec`/`params`/
 ### `compact` options
 
 - `{"shard_ids": [1, 2]}` — vacuum only those shards (plus the index);
-  an **empty** list vacuums the index only, unknown ids raise `ValueError`
-  (compact never creates a shard file), and `shard_ids` in `sqlite_single`
-  mode raises `ValueError`.
+  must be a `list[int] | tuple[int, ...]` of non-bool ints (S5 — any other
+  shape raises `TypeError` at call time); an **empty** list vacuums the index
+  only, unknown ids raise `ValueError` (compact never creates a shard file),
+  and `shard_ids` in `sqlite_single` mode raises `ValueError`. All option
+  validation happens at call time, before an `Operation` exists.
   Default: index + all shards. `VACUUM` runs on a connection with no attached
   databases.
 
@@ -310,7 +315,8 @@ dictionary, and decoding always uses the dictionary recorded in the stored
 encoding row).
 
 **Random writes (replace/remove chapters):** `upsert_chapter` with an
-existing `chapter_key` replaces the chapter body in place (same chapter id;
+existing `chapter_key` (must be `str | int` — S7; `None`/`bool` raise
+`TypeError`) replaces the chapter body in place (same chapter id;
 the old blob becomes garbage) and commits content + catalog **atomically** —
 a failed upsert (missing novel, busy) leaves no orphan blob. Removals are
 catalog-only: `repo.delete_chapter(id)` / `repo.delete_novel(id, cascade=True)`
@@ -336,7 +342,14 @@ DBs). Key invariants:
   not to one chapter. For codec `none`, the raw length IS the stored length,
   so the cap applies to canonical bytes too.
 - `blob_key` is `ikb1:<raw_len>:<sha256_hex>:<blake2b-128_hex>` and is unique
-  (`blobs` PK; `encodings` PK is `(blob_key, profile)`).
+  (`blobs` PK; `encodings` PK is `(blob_key, profile)`). Parsing is strict
+  ASCII canonical (S4): Unicode digits, uppercase hex and other prefixes are
+  rejected.
+- **Decode bound (S3).** Every read parses `raw_len` from the `blob_key` and
+  enforces it as a hard output bound: `zstd` frames whose declared content
+  size exceeds it — or that carry no declared size — are `CorruptContent`;
+  codec `none` requires `len(payload) == raw_len` exactly. A same-length
+  tamper is only caught by `verify_on_read`/`verify()` (identity recompute).
 - `blobs.raw_len` is verified against the key on every write (decision J): a
   mismatched stored `raw_len` raises `CorruptContent` and is never silently
   "repaired".
@@ -344,7 +357,10 @@ DBs). Key invariants:
   the payload row is missing, `put_*` **repairs** it by re-encoding with the
   *stored* policy (never the current profile) — and the same repair applies
   to `upsert_chapter`, so a chapter never commits pointing at missing
-  content. A hit with a missing required dictionary raises `MissingContent`
+  content. When the encoding's shard file is missing or its locator is NULL,
+  repair **rehomes** (S2): the payload is written to an explicitly-ensured
+  writable shard and `encodings.shard_id` is updated atomically in the same
+  transaction. A hit with a missing required dictionary raises `MissingContent`
   ("put succeeded" implies "content is readable"); a stored key whose
   `blob_key` does not match the content is rejected (`CorruptContent`).
 - GC keeps dictionaries referenced by **profiles** in `repo_config` alive

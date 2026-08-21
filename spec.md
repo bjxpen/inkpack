@@ -1569,3 +1569,55 @@ If a blob row already exists:
 - `compact()` succeeds in sharded mode (no ATTACH during VACUUM).
 ---
 
+
+## L) Locked semantics (S1–S9)
+
+**S1 — Operation abandonment (spec §4.2).** `Operation` is single-use.
+`close()` prevents work from starting (if never started) and stops it (if
+started), releasing resources immediately. Abandonment (close, `with` exit,
+or iterator discarded) causes `.result` to raise `Cancelled`. `Operation`
+supports `with op:`; `__exit__` calls `close()`. `.result` must never return
+`None` unless the operation's actual result type is `None`.
+
+**S2 — Sharded ATTACH cannot create files; repair is rehoming (spec §8.2).**
+`ATTACH DATABASE` MUST be performed in a way that cannot create a missing
+file: an explicit existence check plus URI `mode=rw` attach. Shard
+creation/migration MUST be explicit (`_ensure_shard_file`), never implicit
+via ATTACH. Repair policy: when an encoding exists but its referenced shard
+file is missing/unusable and the caller is providing the canonical raw bytes
+(put/upsert paths), Inkpack MUST (1) select a writable shard,
+(2) explicitly ensure/migrate it, (3) write the payload there, and
+(4) atomically update `encodings.shard_id` in the same transaction.
+Reencode/verify/get do not have raw bytes available for rehoming; they must
+not create shards and surface typed errors instead (reencode keeps its
+per-target skip behavior).
+
+**S3 — Decode output bound (spec §6.4).** For every read, `raw_len` is parsed
+from the `blob_key` and enforced as a hard bound. `zstd`: frames without a
+declared content size are `CorruptContent` when bounded; declared size larger
+than the bound is `CorruptContent`; decoding passes
+`max_output_size=raw_len`. `none`: `len(payload) == raw_len` else
+`CorruptContent`. Full identity recompute remains optional
+(`verify_on_read` / `verify()`).
+
+**S4 — `ikb1` parse is strict ASCII canonical (spec §3.2).** Only
+`^ikb1:[0-9]+:[0-9a-f]{64}:[0-9a-f]{32}$` is accepted; Unicode digits,
+uppercase hex and other prefixes are rejected.
+
+**S5 — `compact(options["shard_ids"])` type (spec §10.3).** `shard_ids` is
+`list[int] | tuple[int, ...]` with elements `int` and not `bool`; any other
+shape raises `TypeError` at call time.
+
+**S6 — KV entity id normalization (spec §7.2).** Entity ids are non-negative
+integer primary keys; negative values and `bool` are rejected.
+
+**S7 — `chapter_key` (spec §4.4).** `chapter_key` is `str | int`; `None` and
+`bool` are rejected (never stored as `"None"`/`"True"`).
+
+**S8 — Busy mapping (spec §11).** Public calls must not leak raw sqlite
+busy/locked errors, including open-time validation and migrations: those
+paths map busy/locked to `Busy` too.
+
+**S9 — `list_shards()` (spec §8 operational).** Only files matching
+`shard-<digits>.sqlite` count; all other filenames are ignored so stray files
+cannot crash open/validation/compact.

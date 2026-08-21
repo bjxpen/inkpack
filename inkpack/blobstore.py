@@ -20,7 +20,15 @@ from collections.abc import Generator, Iterable, Iterator
 from dataclasses import dataclass
 from typing import Any, BinaryIO, cast
 
-from .codec import CHUNK_SIZE, IKB1, CodecEngine, Encoded, Identity, dict_id_for_bytes
+from .codec import (
+    CHUNK_SIZE,
+    IKB1,
+    CodecEngine,
+    Encoded,
+    Identity,
+    dict_id_for_bytes,
+    validate_train_dict_options,
+)
 from .sqlite import Session, SqliteBackend
 from .types import (
     CancelToken,
@@ -86,6 +94,10 @@ class BlobStore:
         except KeyError:
             raise UnknownProfile(f"profile not found: {name}") from None
 
+    def _profiles_snapshot(self) -> dict[str, Profile]:
+        """Load the profile map once per public call / operation (review §18)."""
+        return profiles_from_config(self.backend.config_get("profiles"))
+
     def _load_dict(self, profile: Profile, s: Session) -> bytes | None:
         """Load the profile's dictionary on the operation session; codec-aware
         (review §4, P2-1).
@@ -118,10 +130,27 @@ class BlobStore:
 
     # -- prepare / persist ---------------------------------------------------
 
-    def _prepare(self, s: Session, raw: bytes, profile: str, blob_key: str | None) -> PreparedPut:
+    def _prepare(
+        self,
+        s: Session,
+        raw: bytes,
+        profile: str,
+        blob_key: str | None = None,
+        key_tuple: tuple[str, int, str, str] | None = None,
+    ) -> PreparedPut:
+        """Hash + dedupe-check + encode WITHOUT any filesystem side effects.
+
+        Shard selection/creation never happens here (review P0-PREP-1): new
+        encodings carry ``shard_id=None`` and the write path resolves the
+        shard inside its own transaction after the blob-limit check.
+        """
         # Profile map snapshot, read on the operation's connection (review §18).
         profiles = profiles_from_config(s.config("profiles"))
-        if blob_key is None:
+        if key_tuple is not None:
+            # Internal streaming path (review P2-HASH-1): the identity was
+            # already computed while hashing the stream; do not re-hash.
+            blob_key, raw_len, _, _ = key_tuple
+        elif blob_key is None:
             blob_key, raw_len, _, _ = self.identity.key_bytes(raw)
         else:
             raw_len = len(raw)
@@ -155,7 +184,9 @@ class BlobStore:
                 return PreparedPut(blob_key, raw_len, profile, enc=None, shard_id=row["shard_id"])
             # Repair: payload vanished but the encoding row survives. Re-encode
             # with the *stored* policy (never the current profile) so a put
-            # does not silently migrate encoding policy.
+            # does not silently migrate encoding policy. If the referenced
+            # shard is gone/unusable, the persist path REHOMES (locked
+            # semantics S2) — never attaches a missing shard.
             try:
                 stored_params = json.loads(str(row["codec_params_json"]))
             except json.JSONDecodeError as exc:
@@ -170,10 +201,7 @@ class BlobStore:
             return PreparedPut(blob_key, raw_len, profile, enc=enc, shard_id=row["shard_id"])
         prof = self._profile_from(profiles, profile)
         enc = self.codec.encode(raw, prof, self._load_dict(prof, s))
-        shard_id = None
-        if self.backend.mode == "sqlite_sharded":
-            shard_id = self.backend.choose_shard_for_write(enc.stored_len)
-        return PreparedPut(blob_key, raw_len, profile, enc=enc, shard_id=shard_id)
+        return PreparedPut(blob_key, raw_len, profile, enc=enc, shard_id=None)
 
     def prepare_bytes(
         self,
@@ -181,14 +209,19 @@ class BlobStore:
         profile: str,
         *,
         blob_key: str | None = None,
+        key_tuple: tuple[str, int, str, str] | None = None,
         session: Session | None = None,
     ) -> PreparedPut:
         """Hash + dedupe-check + encode without writing (used by put paths and
-        the Repository's atomic chapter upsert)."""
+        the Repository's atomic chapter upsert).
+
+        ``key_tuple`` is the internal streaming path's precomputed identity
+        (avoids re-hashing the spooled bytes, review P2-HASH-1).
+        """
         if session is not None:
-            return self._prepare(session, raw, profile, blob_key)
+            return self._prepare(session, raw, profile, blob_key, key_tuple)
         with self.backend.session() as s:
-            return self._prepare(s, raw, profile, blob_key)
+            return self._prepare(s, raw, profile, blob_key, key_tuple)
 
     def _persist(self, s: Session, prepared: PreparedPut) -> PutResult:
         """Persist a prepared put on the session's connection (one write txn)."""
@@ -210,11 +243,24 @@ class BlobStore:
                 zstd_dict_id=row["zstd_dict_id"],
             )
         self.check_blob_limit(prepared.enc.stored_len, s.conn)
+        # Shard resolution happens here, in the write path, AFTER the
+        # blob-limit check and never during prepare (review P0-PREP-1).
+        # Repair rehoming (locked semantics S2): when the encoding's referenced
+        # shard is missing or its locator is NULL, pick a writable shard
+        # explicitly and update encodings.shard_id in the same transaction.
+        shard_id = prepared.shard_id
+        if self.backend.mode == "sqlite_sharded" and (
+            shard_id is None or not self.backend.shard_path(shard_id).exists()
+        ):
+            # Rehome (locked semantics S2): explicitly select AND ensure the
+            # writable shard — never leave it to ATTACH to create.
+            shard_id = self.backend.choose_shard_for_write(prepared.enc.stored_len)
+            self.backend.ensure_shard_exists(shard_id)
         now = self.backend.now()
         with self.backend.txn_on(
             s.conn,
             write=True,
-            attach_shard_id=prepared.shard_id if self.backend.mode == "sqlite_sharded" else None,
+            attach_shard_id=shard_id if self.backend.mode == "sqlite_sharded" else None,
         ) as conn:
             self.backend.store_encoding_and_payload_on(
                 conn,
@@ -227,7 +273,7 @@ class BlobStore:
                 zstd_dict_id=prepared.enc.zstd_dict_id,
                 stored_len=prepared.enc.stored_len,
                 checksum=None,
-                shard_id=prepared.shard_id,
+                shard_id=shard_id,
                 updated_at=now,
                 payload=prepared.enc.data,
             )
@@ -243,12 +289,14 @@ class BlobStore:
         self,
         fp: BinaryIO,
         cancel: CancelToken | None = None,
-    ) -> Generator[OpEvent, None, tuple[str, bytes]]:
+    ) -> Generator[OpEvent, None, tuple[tuple[str, int, str, str], bytes]]:
         """Single-pass spool + hash, yielding live progress events (review
         P2-3): the caller sees ``bytes_in`` grow *while* the source stream is
         being consumed, not replayed after hashing completes.
 
-        Returns ``(blob_key, raw)`` via the generator's return value.
+        Returns ``((blob_key, raw_len, sha, blake), raw)`` via the generator's
+        return value; the digest tuple is threaded into prepare so the spooled
+        bytes are never re-hashed (review P2-HASH-1).
         """
         hasher = self.identity.hasher()
         with tempfile.SpooledTemporaryFile(max_size=_SPOOL_MAX_SIZE) as spool:
@@ -265,10 +313,10 @@ class BlobStore:
                 if total - last_mark >= PROGRESS_INTERVAL:
                     yield OpEvent(kind="progress", op="put", metrics={"bytes_in": total})
                     last_mark = total
-            blob_key, _, _, _ = hasher.digest()
+            digest = hasher.digest()
             spool.seek(0)
             raw = spool.read()
-        return blob_key, raw
+        return digest, raw
 
     # -- core API (spec 4.3) --------------------------------------------------
 
@@ -300,9 +348,9 @@ class BlobStore:
         def _run() -> Generator[OpEvent, None, PutResult]:
             check_cancel(cancel)
             yield OpEvent(kind="start", op="put", phase="stream_hash")
-            blob_key, raw = yield from self.hash_stream_events(fp, cancel)
+            digest, raw = yield from self.hash_stream_events(fp, cancel)
             with self.backend.session() as s:
-                prepared = self.prepare_bytes(raw, profile, blob_key=blob_key, session=s)
+                prepared = self.prepare_bytes(raw, profile, key_tuple=digest, session=s)
                 result = self._persist(s, prepared)
             yield OpEvent(
                 kind="done",
@@ -383,6 +431,10 @@ class BlobStore:
         options: dict[str, Any] | None = None,
         cancel: CancelToken | None = None,
     ) -> Operation[TrainDictResult]:
+        # Eager option validation (review P2-OPT-1): bad options fail at call
+        # time, before an Operation exists.
+        validate_train_dict_options(options)
+
         def _run() -> Generator[OpEvent, None, TrainDictResult]:
             check_cancel(cancel)
             yield OpEvent(kind="start", op="train_dict")
@@ -418,43 +470,46 @@ class BlobStore:
         - ``{"profile": name}`` re-encodes every target with that profile's policy,
         - ``{"codec": ..., "params": ..., "zstd_dict_id": ...}`` supplies an ad-hoc policy,
           validated with the same rules as ``set_profile`` (review §4).
-        The policy (and the profile map) is frozen at operation start, so
+        The policy (and the profile map) is frozen at call time, so
         ``set_profile`` mid-run cannot change remaining targets (review §18).
         """
 
+        opts = options or {}
+        unknown = set(opts) - _REENCODE_OPTION_KEYS
+        if unknown:
+            raise ValueError(f"unknown reencode options: {sorted(unknown)}")
+        policy_keys = {"codec", "params", "zstd_dict_id"} & set(opts)
+        if "codec" in opts and not isinstance(opts["codec"], str):
+            raise TypeError("reencode option 'codec' must be a string")
+        if "params" in opts and not isinstance(opts["params"], dict):
+            raise TypeError("reencode option 'params' must be a dict")
+        if "zstd_dict_id" in opts and opts["zstd_dict_id"] is not None and not isinstance(opts["zstd_dict_id"], str):
+            raise TypeError("reencode option 'zstd_dict_id' must be a string or None")
+
         def _target_policy(profiles: dict[str, Profile]) -> Profile | None:
-            opts = options or {}
-            unknown = set(opts) - _REENCODE_OPTION_KEYS
-            if unknown:
-                raise ValueError(f"unknown reencode options: {sorted(unknown)}")
-            policy_keys = {"codec", "params", "zstd_dict_id"} & set(opts)
             if "profile" in opts:
-                if policy_keys:
-                    raise ValueError("reencode option 'profile' cannot be combined with codec/params/zstd_dict_id")
                 return self._profile_from(profiles, str(opts["profile"]))
             if not policy_keys:
                 return None
-            codec = str(opts.get("codec", "zstd"))
-            params_raw: Any = opts.get("params") or {}
-            if not isinstance(params_raw, dict):
-                raise TypeError("reencode option 'params' must be a dict")
-            zstd_dict_id = opts.get("zstd_dict_id")
-            if zstd_dict_id is not None and not isinstance(zstd_dict_id, str):
-                raise TypeError("reencode option 'zstd_dict_id' must be a string or None")
             profile = Profile(
                 name="<reencode-override>",
-                codec=codec,
-                params=cast("dict[str, Any]", params_raw),
-                zstd_dict_id=zstd_dict_id,
+                codec=str(opts.get("codec", "zstd")),
+                params=cast("dict[str, Any]", opts.get("params") or {}),
+                zstd_dict_id=opts.get("zstd_dict_id"),
             )
             validate_profile_entry("<reencode-override>", profile)
             return profile
+
+        # Eager conflict check (review P2-OPT-1); the profile lookup itself
+        # happens on the operation's session connection so call-time
+        # validation never touches the DB.
+        if "profile" in opts and policy_keys:
+            raise ValueError("reencode option 'profile' cannot be combined with codec/params/zstd_dict_id")
 
         def _run() -> Generator[OpEvent, None, ReencodeResult]:
             check_cancel(cancel)
             yield OpEvent(kind="start", op="reencode")
             with self.backend.session() as s:
-                # Policy + profile map frozen at operation start (review §18).
                 profiles = profiles_from_config(s.config("profiles"))
                 policy = _target_policy(profiles)
                 targets_seen = reencoded = skipped = 0
@@ -473,10 +528,12 @@ class BlobStore:
                         raw = self._decode_row(s, row)
                         prof = policy or self._profile_from(profiles, ref.profile)
                         enc = self.codec.encode(raw, prof, self._load_dict(prof, s))
-                    except (MissingContent, CorruptContent, UnknownProfile) as exc:
-                        # Per-target data problems (missing payload/dict, corrupt
-                        # payload, deleted profile) must not kill a bulk run
-                        # (review P1-3): skip and keep going.
+                        self.check_blob_limit(enc.stored_len, s.conn)
+                    except (MissingContent, CorruptContent, UnknownProfile, ValueError) as exc:
+                        # Per-target problems (missing payload/dict, corrupt
+                        # payload, deleted profile, payload over the blob
+                        # limit) must not kill a bulk run (review P1-3,
+                        # P1-REENC-1): skip and keep going.
                         skipped += 1
                         yield OpEvent(
                             kind="log",
@@ -485,7 +542,6 @@ class BlobStore:
                             metrics={"targets": targets_seen, "skipped": skipped},
                         )
                         continue
-                    self.check_blob_limit(enc.stored_len, s.conn)
                     # In-place update of payload + encodings in one transaction (spec 7.5).
                     now = self.backend.now()
                     with self.backend.txn_on(
@@ -645,32 +701,44 @@ class BlobStore:
     ) -> Operation[CompactResult]:
         """VACUUM the index and (in sharded mode) selected/all shards (spec 10.3, decision H).
 
-        ``options["shard_ids"]`` is only meaningful in sharded mode: passing it
-        to ``sqlite_single`` raises ``ValueError``, and an empty list vacuums
-        the index only (review P1-4). Unknown shard ids are rejected — compact
-        never creates a shard file (review P0-2).
+        Options are validated eagerly at call time (review P2-OPT-1):
+        ``shard_ids`` must be a ``list[int] | tuple[int, ...]`` of non-bool
+        ints (locked semantics S5), is rejected in ``sqlite_single`` mode, and
+        unknown shard ids raise ``ValueError`` — compact never creates a shard
+        file (review P0-2).
         """
+        opts = options or {}
+        unknown = set(opts) - _COMPACT_OPTION_KEYS
+        if unknown:
+            raise ValueError(f"unknown compact options: {sorted(unknown)}")
+        requested: list[int] | None = None
+        if "shard_ids" in opts:
+            if self.backend.mode != "sqlite_sharded":
+                raise ValueError("compact option 'shard_ids' is only valid for sqlite_sharded")
+            shard_ids_value: Any = opts["shard_ids"]
+            if not isinstance(shard_ids_value, (list, tuple)):
+                raise TypeError(
+                    "compact option 'shard_ids' must be a list or tuple of ints, "
+                    f"got {type(shard_ids_value).__name__}"
+                )
+            requested = []
+            for raw_sid in cast("tuple[Any, ...] | list[Any]", shard_ids_value):  # type: ignore[redundant-cast]  # pyright: ignore[reportUnknownVariableType]
+                if isinstance(raw_sid, bool) or not isinstance(raw_sid, int):
+                    raise TypeError(f"compact option 'shard_ids' must contain ints, got {raw_sid!r}")
+                requested.append(raw_sid)
+            existing = set(self.backend.list_shards())
+            unknown_shards = [sid for sid in requested if sid not in existing]
+            if unknown_shards:
+                raise ValueError(f"unknown shard ids: {unknown_shards}")
 
         def _run() -> Generator[OpEvent, None, CompactResult]:
             check_cancel(cancel)
-            opts = options or {}
-            unknown = set(opts) - _COMPACT_OPTION_KEYS
-            if unknown:
-                raise ValueError(f"unknown compact options: {sorted(unknown)}")
-            if "shard_ids" in opts and self.backend.mode != "sqlite_sharded":
-                raise ValueError("compact option 'shard_ids' is only valid for sqlite_sharded")
             targets: list[str] = []
             yield OpEvent(kind="start", op="compact")
             targets.append(self.backend.vacuum_index())
             if self.backend.mode == "sqlite_sharded":
-                existing = set(self.backend.list_shards())
-                requested = (
-                    [int(sid) for sid in opts["shard_ids"]] if "shard_ids" in opts else sorted(existing)
-                )
-                unknown_shards = [sid for sid in requested if sid not in existing]
-                if unknown_shards:
-                    raise ValueError(f"unknown shard ids: {unknown_shards}")
-                for shard_id in requested:
+                shard_ids = requested if requested is not None else sorted(self.backend.list_shards())
+                for shard_id in shard_ids:
                     check_cancel(cancel)
                     targets.append(self.backend.vacuum_shard(shard_id))
             result = CompactResult(mode="vacuum", targets=targets)

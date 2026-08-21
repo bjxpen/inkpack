@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
 from typing import Any, BinaryIO, Protocol
@@ -18,6 +19,11 @@ import zstandard as _zstd
 from .types import CancelToken, CorruptContent, Profile, check_cancel
 
 CHUNK_SIZE = 128 * 1024
+
+# Strict ASCII-canonical ikb1 key format (locked semantics S4): ASCII digits
+# only, lowercase hex, exact lengths. Unicode digits, uppercase hex, other
+# prefixes and malformed lengths are all rejected.
+_IKB1_RE = re.compile(r"^ikb1:[0-9]+:[0-9a-f]{64}:[0-9a-f]{32}$")
 
 
 def canonical_json(obj: Any) -> str:
@@ -138,17 +144,15 @@ class IKB1Identity:
         return self.key_from_chunks(_iter_reads(fp), cancel, on_bytes=on_bytes)
 
     def parse(self, blob_key: str) -> tuple[int, str, str]:
-        parts = blob_key.split(":")
-        if len(parts) != 4 or parts[0] != "ikb1":
+        """Extract ``(raw_len, sha256_hex, blake2b128_hex)``.
+
+        Strict canonical parse (locked semantics S4): only the exact
+        ``ikb1:<ascii-digits>:<64 lowercase hex>:<32 lowercase hex>`` shape is
+        accepted.
+        """
+        if not _IKB1_RE.match(blob_key):
             raise ValueError(f"invalid blob_key: {blob_key!r}")
-        _, raw_len_s, sha, blake = parts
-        if not raw_len_s.isdigit() or len(sha) != 64 or len(blake) != 32:
-            raise ValueError(f"invalid blob_key: {blob_key!r}")
-        try:
-            int(sha, 16)
-            int(blake, 16)
-        except ValueError as exc:
-            raise ValueError(f"invalid blob_key: {blob_key!r}") from exc
+        _, raw_len_s, sha, blake = blob_key.split(":")
         return int(raw_len_s), sha, blake
 
 
@@ -207,6 +211,19 @@ def dict_id_for_bytes(dict_bytes: bytes) -> str:
     return "ikd1:" + hashlib.sha256(dict_bytes).hexdigest()
 
 
+def validate_train_dict_options(options: dict[str, Any] | None) -> dict[str, Any]:
+    """Validate ``train_dict`` options (shared by call-time eager validation
+    and the codec engine)."""
+    options = dict(options or {})
+    unknown = set(options) - {"dict_size"}
+    if unknown:
+        raise ValueError(f"unknown train_dict options: {sorted(unknown)}")
+    dict_size = options.get("dict_size", 4096)
+    if not isinstance(dict_size, int) or isinstance(dict_size, bool) or not 256 <= dict_size <= (1 << 26):
+        raise ValueError(f"dict_size must be an integer in 256..67108864, got {dict_size!r}")
+    return options
+
+
 class CodecEngine:
     """Encoding engine: ``none`` (identity) and ``zstd`` (with optional dict).
 
@@ -262,27 +279,44 @@ class CodecEngine:
     ) -> bytes:
         del codec_params_json  # kept in the contract; zstd decoding needs no params
         if codec == "none":
+            # Locked semantics S3: codec 'none' stores the raw bytes, so the
+            # stored length must equal the blob_key's declared raw_len.
+            if max_output_size is not None and len(encoded) != max_output_size:
+                raise CorruptContent(
+                    f"codec 'none' payload length {len(encoded)} does not match the "
+                    f"declared raw_len {max_output_size}"
+                )
             return encoded
         if codec != "zstd":
             raise ValueError(f"unsupported codec: {codec!r}")
         if max_output_size is not None:
-            # Bound decompressed output using the canonical raw_len from the
-            # blob_key (review P2-6). One-shot decompress grows its output
-            # buffer regardless of max_output_size, so the real guard is the
-            # frame header's declared content size, checked BEFORE any
-            # allocation happens. Frames without a declared size are only
-            # produced by external tooling; our compressor always writes one.
+            # Locked semantics S3: enforce the blob_key's raw_len as a hard
+            # decode bound. The frame header's declared content size is
+            # checked BEFORE any allocation; a frame with no declared size is
+            # rejected when bounded (one-shot decompress would otherwise grow
+            # its output buffer regardless of max_output_size).
             try:
                 declared = _zstd.frame_content_size(encoded)
             except Exception as exc:
                 raise CorruptContent(f"zstd decode failed: {exc}") from exc
-            if declared and declared > max_output_size:
+            if declared < 0:
+                # zstandard reports -1 when the frame header carries no
+                # content size; a bound then cannot be enforced.
+                raise CorruptContent(
+                    "zstd frame has no declared content size; cannot bound decode to "
+                    f"{max_output_size} bytes"
+                )
+            if declared > max_output_size:
                 raise CorruptContent(
                     f"zstd frame declares {declared} bytes, exceeding the bound of "
                     f"{max_output_size} declared by the blob_key"
                 )
         try:
             dict_data = _zstd.ZstdCompressionDict(dict_bytes) if dict_bytes is not None else None
+            if max_output_size is not None:
+                return _zstd.ZstdDecompressor(dict_data=dict_data).decompress(
+                    encoded, max_output_size=max_output_size
+                )
             return _zstd.ZstdDecompressor(dict_data=dict_data).decompress(encoded)
         except Exception as exc:
             raise CorruptContent(f"zstd decode failed: {exc}") from exc
@@ -294,13 +328,8 @@ class CodecEngine:
         cancel: CancelToken | None = None,
     ) -> tuple[bytes, str, int, int]:
         """Train a zstd dictionary; returns ``(dict_bytes, params_json, samples_used, sample_bytes)``."""
-        options = dict(options or {})
-        unknown = set(options) - {"dict_size"}
-        if unknown:
-            raise ValueError(f"unknown train_dict options: {sorted(unknown)}")
+        options = validate_train_dict_options(options)
         dict_size = options.get("dict_size", 4096)
-        if not isinstance(dict_size, int) or isinstance(dict_size, bool) or not 256 <= dict_size <= (1 << 26):
-            raise ValueError(f"dict_size must be an integer in 256..67108864, got {dict_size!r}")
 
         sample_list: list[bytes | bytearray | memoryview] = []
         sample_bytes = 0

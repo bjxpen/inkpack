@@ -47,14 +47,20 @@ class Repository:
 
         The profile is validated (codec must be ``none``/``zstd``,
         ``zstd_dict_id`` only with ``zstd``) before being stored, so invalid
-        definitions fail fast instead of surfacing later at write time.
+        definitions fail fast instead of surfacing later at write time. The
+        read-modify-write happens inside ONE write transaction (review
+        P1-CFG-1): concurrent ``set_profile`` calls cannot lose updates.
         """
         if not isinstance(cast("Any", profile), Profile):
             raise TypeError(f"profile must be a Profile instance, got {type(profile).__name__}")
         validate_profiles({profile.name: profile})
-        profiles = self.get_profiles()
-        profiles[profile.name] = profile
-        self.backend.config_set("profiles", profiles_to_config(profiles))
+
+        def _merge(current: Any) -> dict[str, Any]:
+            profiles = profiles_from_config(current)
+            profiles[profile.name] = profile
+            return profiles_to_config(profiles)
+
+        self.backend.config_update("profiles", _merge)
 
     def set_profiles(self, profiles: dict[str, Profile]) -> None:
         """Replace the whole profile set and persist it in the repo config.
@@ -115,6 +121,17 @@ class Repository:
         if not self.backend.delete_chapter(int(chapter_id)):
             raise NotFound(f"chapter {chapter_id} not found")
 
+    @staticmethod
+    def _normalize_chapter_key(chapter_key: str | int) -> str:
+        """Validate and normalize a chapter key (locked semantics S7): only
+        ``str`` or ``int``; ``None`` and ``bool`` are rejected so the catalog
+        never stores ``"None"`` / ``"True"``."""
+        if isinstance(chapter_key, bool) or not isinstance(cast("Any", chapter_key), (str, int)):
+            raise TypeError(
+                f"chapter_key must be str or int, got {type(chapter_key).__name__}"
+            )
+        return str(chapter_key)
+
     def _require_novel(self, novel_id: int) -> None:
         """Fail fast on a missing novel BEFORE hashing/encoding/shard
         allocation, so a failed upsert has no side effects (review P1-1). The
@@ -137,13 +154,14 @@ class Repository:
         shard behind.
         """
         self._require_novel(novel_id)
+        order_key = self._normalize_chapter_key(chapter_key)
         hints = hints or {}
         prepared = self.store.prepare_bytes(body_bytes, profile)
         if prepared.enc is not None:
             self.store.check_blob_limit(prepared.enc.stored_len)
         return self.backend.upsert_chapter_with_content(
             novel_id=int(novel_id),
-            order_key=str(chapter_key),
+            order_key=order_key,
             blob_key=prepared.blob_key,
             raw_len=prepared.raw_len,
             created_at=self.backend.now(),
@@ -169,19 +187,26 @@ class Repository:
         """Streaming upsert: hashes the stream (live progress events) then
         commits content + catalog atomically. Returns an Operation[int]."""
         del size_hint
+        order_key = self._normalize_chapter_key(chapter_key)
         hints = hints or {}
 
         def _run() -> Generator[OpEvent, None, int]:
             check_cancel(cancel)
             self._require_novel(novel_id)
             yield OpEvent(kind="start", op="put", phase="stream_hash")
-            blob_key, raw = yield from self.store.hash_stream_events(fp, cancel)
-            prepared: PreparedPut = self.store.prepare_bytes(raw, profile, blob_key=blob_key)
+            digest, raw = yield from self.store.hash_stream_events(fp, cancel)
+            prepared: PreparedPut = self.store.prepare_bytes(raw, profile, key_tuple=digest)
             if prepared.enc is not None:
                 self.store.check_blob_limit(prepared.enc.stored_len)
+                bytes_out = prepared.enc.stored_len
+            else:
+                # Dedupe hit: report the stored encoding's length, never 0
+                # (review P2-METRIC-1).
+                row = self.backend.get_encoding(prepared.blob_key, prepared.profile)
+                bytes_out = int(row["stored_len"]) if row is not None else 0
             chapter_id = self.backend.upsert_chapter_with_content(
                 novel_id=int(novel_id),
-                order_key=str(chapter_key),
+                order_key=order_key,
                 blob_key=prepared.blob_key,
                 raw_len=prepared.raw_len,
                 created_at=self.backend.now(),
@@ -195,7 +220,7 @@ class Repository:
             yield OpEvent(
                 kind="done",
                 op="put",
-                metrics={"bytes_in": len(raw), "bytes_out": prepared.enc.stored_len if prepared.enc else 0},
+                metrics={"bytes_in": len(raw), "bytes_out": bytes_out},
             )
             return chapter_id
 

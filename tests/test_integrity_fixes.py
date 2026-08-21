@@ -170,7 +170,11 @@ def test_gc_repairs_mixed_shard_locations(repo_sharded):
 # -- P0-4: NULL shard repair is a typed error -----------------------------------
 
 
-def test_null_shard_id_repair_is_typed_error(repo_sharded):
+def test_null_shard_id_repair_rehomes(repo_sharded):
+    """Locked semantics S2: with raw bytes available, a NULL shard locator is
+    repaired by REHOMING — the payload is written to a writable shard and
+    encodings.shard_id is updated in the same transaction. No raw sqlite
+    errors, no junk shard."""
     put = repo_sharded.store.put_bytes(b"z" * 100, "raw").result
     row = repo_sharded.backend.get_encoding(put.ref.blob_key, put.ref.profile)
     with repo_sharded.backend.txn(write=True, attach_shard_id=int(row["shard_id"])) as conn:
@@ -183,8 +187,12 @@ def test_null_shard_id_repair_is_typed_error(repo_sharded):
             "UPDATE encodings SET shard_id=NULL WHERE blob_key=? AND profile=?",
             (put.ref.blob_key, put.ref.profile),
         )
-    with pytest.raises((CorruptContent, InkpackError, MissingContent)):
-        repo_sharded.store.put_bytes(b"z" * 100, "raw").result
+    # Repair via rehoming: succeeds, locator repaired, content readable.
+    repaired = repo_sharded.store.put_bytes(b"z" * 100, "raw").result
+    row_after = repo_sharded.backend.get_encoding(repaired.ref.blob_key, repaired.ref.profile)
+    assert row_after["shard_id"] is not None
+    assert repo_sharded.backend.shard_path(int(row_after["shard_id"])).exists()
+    assert repo_sharded.store.get_bytes(repaired.ref) == b"z" * 100
 
 
 # -- P0-5: prepare_bytes binds blob_key to content ------------------------------

@@ -51,16 +51,26 @@ class Operation(Generic[T]):
     The operation is single-use: the underlying generator is created on first
     iteration and consumed until exhaustion. The generator's ``return`` value
     is captured as the operation result.
+
+    Abandonment is deterministic (locked semantics S1): ``close()`` (or the
+    ``with op:`` context manager, or discarding the iterator) prevents an
+    unstarted operation from running, releases resources immediately, and
+    makes ``.result`` raise :class:`Cancelled`.
     """
+
+    _UNSET = object()
 
     def __init__(self, iterator_factory: Callable[[], Generator[OpEvent, None, T]]) -> None:
         self._iterator_factory = iterator_factory
         self._iterator: Generator[OpEvent, None, T] | None = None
-        self._result: T | None = None
+        self._result: T | object = Operation._UNSET
         self._error: BaseException | None = None
         self._done = False
 
     def __iter__(self) -> Iterator[OpEvent]:
+        if self._done:
+            # Closed before starting (P0-OP-1): never start the generator.
+            return
         if self._iterator is None:
             self._iterator = self._iterator_factory()
         iterator = self._iterator
@@ -71,23 +81,31 @@ class Operation(Generic[T]):
                 except StopIteration as stop:
                     # A generator's `return value` arrives via StopIteration.value.
                     # Re-iterating an already-finished operation must not
-                    # clobber the captured result (StopIteration.value is None
-                    # on an exhausted generator).
+                    # clobber the captured result.
                     if not self._done:
                         self._result = cast("T", stop.value)
                     self._done = True
                     return
                 yield event
         except GeneratorExit:
-            # The consumer abandoned iteration: close the inner generator
-            # deterministically so its finally blocks (session teardown) run
-            # now instead of at an unspecified GC time (review P2-5).
+            # The consumer abandoned iteration (P0-OP-2): mark the operation
+            # as cancelled deterministically — .result must not depend on GC
+            # or resume a half-run generator.
+            self._done = True
+            self._error = Cancelled("operation abandoned before completion")
             iterator.close()
             raise
         except BaseException as exc:
             self._error = exc
             self._done = True
             raise
+
+    def __enter__(self) -> Operation[T]:
+        return self
+
+    def __exit__(self, *exc_info: object) -> Literal[False]:
+        self.close()
+        return False
 
     def close(self) -> None:
         """Abandon the operation early, releasing any resources (e.g. the
@@ -115,6 +133,9 @@ class Operation(Generic[T]):
         if self._error is not None:
             raise self._error
         assert self._done, "operation was never fully iterated"
+        if self._result is Operation._UNSET:
+            # Never return None as a stand-in for a missing result (S1).
+            raise InkpackError("operation produced no result")
         return cast("T", self._result)
 
 
