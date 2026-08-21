@@ -1,62 +1,153 @@
+"""Identity policy (``ikb1``), canonical JSON and the codec engine.
+
+Owns the single-pass streaming identity used for blob keys and dedupe, the
+canonical JSON serialization stored in ``encodings.codec_params_json``, and
+the pluggable codec engine (``none`` and dictionary-capable ``zstd``).
+"""
+
 from __future__ import annotations
 
 import hashlib
-import io
 import json
-import zlib
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
-from typing import Iterable
+from typing import Any, BinaryIO, Protocol
 
-from .types import Cancelled, Profile
+import zstandard as _zstd
 
+from .types import CancelToken, CorruptContent, Profile, check_cancel
 
-def _check_cancel(cancel) -> None:
-    if cancel and cancel():
-        raise Cancelled("operation cancelled")
-
-
-def canonical_json(obj) -> str:
-    return json.dumps(
-        obj,
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=False,
-        allow_nan=False,
-    )
+CHUNK_SIZE = 128 * 1024
 
 
-def blob_key_ikb1_stream(fp, size_hint=None, cancel=None) -> tuple[str, int, str, str]:
-    del size_hint
-    h1 = hashlib.sha256()
-    h2 = hashlib.blake2b(digest_size=16)
-    raw_len = 0
+def canonical_json(obj: Any) -> str:
+    """Stable canonical JSON (sorted keys, compact separators; spec 7.3 / decision B)."""
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
+
+
+# ---------------------------------------------------------------------------
+# ikb1 identity policy (spec 3.2)
+# ---------------------------------------------------------------------------
+
+
+class Identity(Protocol):
+    """Repo-level identity policy: computes and parses blob keys."""
+
+    name: str
+
+    def key_bytes(self, data: bytes) -> tuple[str, int, str, str]:
+        """Return ``(blob_key, raw_len, sha256_hex, blake2b128_hex)`` for bytes."""
+        ...
+
+    def key_stream(
+        self,
+        fp: BinaryIO,
+        size_hint: int | None = None,
+        cancel: CancelToken | None = None,
+    ) -> tuple[str, int, str, str]:
+        """Single-pass identity over a binary stream."""
+        ...
+
+    def key_from_chunks(
+        self,
+        chunks: Iterable[bytes],
+        cancel: CancelToken | None = None,
+    ) -> tuple[str, int, str, str]:
+        """Single-pass identity over an iterable of byte chunks."""
+        ...
+
+    def parse(self, blob_key: str) -> tuple[int, str, str]:
+        """Extract ``(raw_len, sha256_hex, blake2b128_hex)``; raise on bad format."""
+        ...
+
+
+class IKB1Identity:
+    """Default ``ikb1`` policy: ``ikb1:<raw_len>:<sha256>:<blake2b-128>``."""
+
+    name = "ikb1"
+
+    def key_from_chunks(
+        self,
+        chunks: Iterable[bytes],
+        cancel: CancelToken | None = None,
+    ) -> tuple[str, int, str, str]:
+        sha = hashlib.sha256()
+        blake = hashlib.blake2b(digest_size=16)
+        raw_len = 0
+        for chunk in chunks:
+            check_cancel(cancel)
+            raw_len += len(chunk)
+            sha.update(chunk)
+            blake.update(chunk)
+        sha_hex, blake_hex = sha.hexdigest(), blake.hexdigest()
+        return f"ikb1:{raw_len}:{sha_hex}:{blake_hex}", raw_len, sha_hex, blake_hex
+
+    def key_bytes(self, data: bytes) -> tuple[str, int, str, str]:
+        return self.key_from_chunks([data])
+
+    def key_stream(
+        self,
+        fp: BinaryIO,
+        size_hint: int | None = None,
+        cancel: CancelToken | None = None,
+    ) -> tuple[str, int, str, str]:
+        del size_hint  # the stream is hashed exactly; the hint only reserves space
+        return self.key_from_chunks(_iter_reads(fp), cancel)
+
+    def parse(self, blob_key: str) -> tuple[int, str, str]:
+        parts = blob_key.split(":")
+        if len(parts) != 4 or parts[0] != "ikb1":
+            raise ValueError(f"invalid blob_key: {blob_key!r}")
+        _, raw_len_s, sha, blake = parts
+        if not raw_len_s.isdigit() or len(sha) != 64 or len(blake) != 32:
+            raise ValueError(f"invalid blob_key: {blob_key!r}")
+        try:
+            int(sha, 16)
+            int(blake, 16)
+        except ValueError as exc:
+            raise ValueError(f"invalid blob_key: {blob_key!r}") from exc
+        return int(raw_len_s), sha, blake
+
+
+def _iter_reads(fp: BinaryIO) -> Iterator[bytes]:
     while True:
-        _check_cancel(cancel)
-        chunk = fp.read(1024 * 128)
+        chunk = fp.read(CHUNK_SIZE)
         if not chunk:
-            break
-        raw_len += len(chunk)
-        h1.update(chunk)
-        h2.update(chunk)
-    sha = h1.hexdigest()
-    b2 = h2.hexdigest()
-    return f"ikb1:{raw_len}:{sha}:{b2}", raw_len, sha, b2
+            return
+        yield chunk
+
+
+# Singleton used as the default identity; module-level functions kept as a
+# convenience for callers that want plain function access (e.g. tests).
+IKB1 = IKB1Identity()
 
 
 def blob_key_ikb1_bytes(data: bytes) -> tuple[str, int, str, str]:
-    return blob_key_ikb1_stream(io.BytesIO(data))
+    return IKB1.key_bytes(data)
+
+
+def blob_key_ikb1_stream(
+    fp: BinaryIO,
+    size_hint: int | None = None,
+    cancel: CancelToken | None = None,
+) -> tuple[str, int, str, str]:
+    return IKB1.key_stream(fp, size_hint=size_hint, cancel=cancel)
+
+
+def blob_key_ikb1_from_chunks(
+    chunks: Iterable[bytes],
+    cancel: CancelToken | None = None,
+) -> tuple[str, int, str, str]:
+    return IKB1.key_from_chunks(chunks, cancel=cancel)
 
 
 def parse_blob_key_ikb1(blob_key: str) -> tuple[int, str, str]:
-    parts = blob_key.split(":")
-    if len(parts) != 4 or parts[0] != "ikb1":
-        raise ValueError("invalid blob_key")
-    raw_len = int(parts[1])
-    sha = parts[2]
-    b2 = parts[3]
-    if len(sha) != 64 or len(b2) != 32:
-        raise ValueError("invalid blob_key digest lengths")
-    return raw_len, sha, b2
+    return IKB1.parse(blob_key)
+
+
+# ---------------------------------------------------------------------------
+# Codec engine
+# ---------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
@@ -68,63 +159,116 @@ class Encoded:
     stored_len: int
 
 
+def dict_id_for_bytes(dict_bytes: bytes) -> str:
+    """Stable content-addressed id for a trained dictionary."""
+    return "ikd1:" + hashlib.sha256(dict_bytes).hexdigest()
+
+
 class CodecEngine:
+    """Encoding engine: ``none`` (identity) and ``zstd`` (with optional dict).
+
+    ``decode`` deliberately takes only *stored* encoding metadata (spec 6.2);
+    it never receives a :class:`Profile`.
+
+    All zstd engine failures are translated to typed API errors so callers
+    never see raw ``zstandard`` exceptions:
+    - encode-side problems (bad profile params, unusable dictionary) become
+      :class:`ValueError` with an actionable message;
+    - decode-side problems become :class:`CorruptContent`.
+    """
+
+    dict_codec = "zstd"
+
     def encode(self, raw: bytes, profile: Profile, dict_bytes: bytes | None) -> Encoded:
         if profile.codec == "none":
-            payload = raw
-            params_json = canonical_json(profile.params or {})
             return Encoded(
                 codec="none",
-                codec_params_json=params_json,
+                codec_params_json=canonical_json({}),
                 zstd_dict_id=None,
-                data=payload,
-                stored_len=len(payload),
+                data=raw,
+                stored_len=len(raw),
             )
         if profile.codec != "zstd":
-            raise ValueError(f"unsupported codec: {profile.codec}")
-        level = int((profile.params or {}).get("level", 6))
-        comp = zlib.compressobj(level=level, wbits=zlib.MAX_WBITS, zdict=dict_bytes or b"")
-        payload = comp.compress(raw) + comp.flush()
-        params_json = canonical_json({"level": level})
+            raise ValueError(f"unsupported codec: {profile.codec!r}")
+        level = profile.params.get("level", 6)
+        if not isinstance(level, int) or isinstance(level, bool) or not 1 <= level <= 22:
+            raise ValueError(f"zstd level must be an integer in 1..22, got {level!r}")
+        try:
+            dict_data = _zstd.ZstdCompressionDict(dict_bytes) if dict_bytes is not None else None
+            payload = _zstd.ZstdCompressor(level=level, dict_data=dict_data).compress(raw)
+        except Exception as exc:
+            raise ValueError(
+                f"zstd encode failed (profile {profile.name!r}, level {level}): {exc}"
+            ) from exc
         return Encoded(
             codec="zstd",
-            codec_params_json=params_json,
-            zstd_dict_id=profile.zstd_dict_id if dict_bytes else None,
+            codec_params_json=canonical_json({"level": level}),
+            zstd_dict_id=profile.zstd_dict_id if dict_bytes is not None else None,
             data=payload,
             stored_len=len(payload),
         )
 
-    def decode(self, encoded: bytes, *, codec: str, codec_params_json: str, dict_bytes: bytes | None) -> bytes:
-        del codec_params_json
+    def decode(
+        self,
+        encoded: bytes,
+        *,
+        codec: str,
+        codec_params_json: str,
+        dict_bytes: bytes | None,
+    ) -> bytes:
+        del codec_params_json  # kept in the contract; zstd decoding needs no params
         if codec == "none":
             return encoded
         if codec != "zstd":
-            raise ValueError(f"unsupported codec: {codec}")
-        d = zlib.decompressobj(wbits=zlib.MAX_WBITS, zdict=dict_bytes or b"")
-        return d.decompress(encoded) + d.flush()
+            raise ValueError(f"unsupported codec: {codec!r}")
+        try:
+            dict_data = _zstd.ZstdCompressionDict(dict_bytes) if dict_bytes is not None else None
+            return _zstd.ZstdDecompressor(dict_data=dict_data).decompress(encoded)
+        except Exception as exc:
+            raise CorruptContent(f"zstd decode failed: {exc}") from exc
 
-    def train_dict(self, samples: Iterable[bytes], options=None, cancel=None) -> tuple[bytes, str | None, int, int]:
-        options = options or {}
-        dict_size = int(options.get("dict_size", 4096))
-        chunks: list[bytes] = []
+    def train_dict(
+        self,
+        samples: Iterable[bytes],
+        options: dict[str, Any] | None = None,
+        cancel: CancelToken | None = None,
+    ) -> tuple[bytes, str, int, int]:
+        """Train a zstd dictionary; returns ``(dict_bytes, params_json, samples_used, sample_bytes)``."""
+        options = dict(options or {})
+        unknown = set(options) - {"dict_size"}
+        if unknown:
+            raise ValueError(f"unknown train_dict options: {sorted(unknown)}")
+        dict_size = options.get("dict_size", 4096)
+        if not isinstance(dict_size, int) or isinstance(dict_size, bool) or not 256 <= dict_size <= (1 << 26):
+            raise ValueError(f"dict_size must be an integer in 256..67108864, got {dict_size!r}")
+
+        sample_list: list[bytes | bytearray | memoryview] = []
         sample_bytes = 0
-        samples_used = 0
         for sample in samples:
-            _check_cancel(cancel)
+            check_cancel(cancel)
             if not sample:
                 continue
-            samples_used += 1
+            sample_list.append(sample)
             sample_bytes += len(sample)
-            tail = sample[-min(len(sample), 256) :]
-            chunks.append(tail)
-            if sum(len(x) for x in chunks) >= dict_size:
-                break
-        blob = b"".join(chunks)
-        if len(blob) > dict_size:
-            blob = blob[-dict_size:]
-        params_json = canonical_json({"dict_size": len(blob)})
-        return blob, params_json, samples_used, sample_bytes
-
-
-def dict_id_for_bytes(dict_bytes: bytes) -> str:
-    return "ikd1:" + hashlib.sha256(dict_bytes).hexdigest()
+        # zstd's dictionary trainer (fastCover) has hard input minimums:
+        # with split_point=1.0 (all samples used for training) it needs at
+        # least 5 samples and at least 8 total bytes of sample data.
+        if len(sample_list) < 5:
+            raise ValueError(
+                f"train_dict requires at least 5 non-empty samples (got {len(sample_list)}); "
+                "zstd needs enough material to build a dictionary - train on the novel's "
+                "chapter bodies, or aggregate shorter chapters into one sample each"
+            )
+        if sample_bytes < 8:
+            raise ValueError(
+                f"train_dict requires at least 8 bytes of sample data (got {sample_bytes})"
+            )
+        try:
+            dict_bytes = _zstd.train_dictionary(dict_size, sample_list, split_point=1.0).as_bytes()
+        except Exception as exc:
+            raise ValueError(
+                f"zstd dictionary training failed (dict_size={dict_size}, "
+                f"{len(sample_list)} samples, {sample_bytes} bytes): {exc}"
+            ) from exc
+        params_json = canonical_json({"dict_size": len(dict_bytes), "samples_used": len(sample_list)})
+        return dict_bytes, params_json, len(sample_list), sample_bytes

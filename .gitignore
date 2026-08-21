@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+
+# Tooling caches
+.mypy_cache/
+.pyright/
+.pytest_cache/
+.ruff_cache/
+.hypothesis/
+build/
+dist/
