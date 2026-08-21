@@ -2,13 +2,18 @@
 
 from __future__ import annotations
 
+import random
 import sqlite3
 
 import pytest
 
-from inkpack import MissingContent
+from inkpack import MissingContent, Profile, open_repo
 
 from .conftest import assert_repo_consistent, enc_row, make_repo
+
+
+def _chapter_text(rng: random.Random, words: list[str], n: int = 60) -> bytes:
+    return " ".join(rng.choice(words) for _ in range(n)).encode()
 
 
 def test_layout_files(repo_sharded):
@@ -135,3 +140,93 @@ def test_sharded_choose_shard_respects_configured_cap(tmp_path):
     assert len(repo.backend.list_shards()) >= 3
     for ref in refs:
         assert repo.store.get_bytes(ref) is not None
+
+
+# -- end-to-end workflows on the sharded backend ------------------------------
+
+
+def test_sharded_dedupe_across_shards(repo_sharded):
+    """Dedupe still hits after a shard roll: one encoding, payload in one shard."""
+    body = b"cross-shard-dedupe " * 100_000  # ~2 MB, fills shard 1
+    first = repo_sharded.store.put_bytes(body, profile="raw").result
+    repo_sharded.store.put_bytes(b"filler " * 60_000, profile="raw").result  # rolls to shard 2
+    assert len(repo_sharded.backend.list_shards()) >= 2
+
+    again = repo_sharded.store.put_bytes(body, profile="raw").result
+    assert again.ref.blob_key == first.ref.blob_key
+    with repo_sharded.backend.txn(write=False) as conn:
+        n = int(
+            conn.execute(
+                "SELECT COUNT(*) FROM encodings WHERE blob_key=?", (first.ref.blob_key,)
+            ).fetchone()[0]
+        )
+    assert n == 1
+    row = enc_row(repo_sharded, first.ref)
+    shard_id = int(row["shard_id"])
+    with repo_sharded.backend.txn(write=False, attach_shard_id=shard_id) as conn:
+        found = conn.execute(
+            "SELECT 1 FROM p.payload WHERE blob_key=? AND profile=?",
+            (first.ref.blob_key, "raw"),
+        ).fetchone()
+    assert found is not None
+    verify = repo_sharded.store.verify().result
+    assert verify.ok == 2 and verify.missing == 0 and verify.corrupt == 0
+
+
+def test_sharded_end_to_end_workflow(repo_sharded):
+    """Full novel-library lifecycle on the sharded backend."""
+    rng = random.Random(77)
+    words = ["shard", "index", "payload", "journal", "attach", "commit", "atomic", "rollback"]
+    novel_id = repo_sharded.create_novel("Sharded Saga")
+    bodies = [_chapter_text(rng, words) for _ in range(10)]
+    for i, body in enumerate(bodies):
+        repo_sharded.upsert_chapter(novel_id, f"{i:04d}", body, "raw")
+    refs = list(repo_sharded.iter_live_content(scope=novel_id))
+    assert refs
+
+    # Build a dictionary from the novel and recompress with it.
+    train = repo_sharded.store.train_dict(bodies).result
+    repo_sharded.set_profile(Profile(name="zstd_dict", codec="zstd", params={"level": 6}, zstd_dict_id=train.dict_id))
+    repo_sharded.store.reencode(refs, options={"profile": "zstd_dict"}).result
+    for ref in refs:
+        assert enc_row(repo_sharded, ref)["zstd_dict_id"] == train.dict_id
+        assert repo_sharded.store.get_bytes(ref) in bodies
+    assert repo_sharded.store.verify().result.ok == len(refs)
+
+    # Remove half the chapters, GC, confirm the rest is intact.
+    with repo_sharded.backend.txn(write=True) as conn:
+        rows = conn.execute("SELECT id FROM chapters").fetchall()
+        for i, row in enumerate(rows):
+            if i % 2:
+                conn.execute("DELETE FROM chapters WHERE id=?", (row[0],))
+    live = list(repo_sharded.iter_live_content())
+    assert 0 < len(live) < len(refs)
+    gc = repo_sharded.store.gc(live=live).result
+    assert gc.encodings_deleted == len(refs) - len(live)
+    for ref in live:
+        assert repo_sharded.store.get_bytes(ref) in bodies
+    verify = repo_sharded.store.verify().result
+    assert verify.ok == len(live) and verify.missing == 0 and verify.corrupt == 0
+
+    # Compact, reopen, verify again from the reopened handle.
+    repo_sharded.store.compact().result
+    reopened = open_repo(repo_sharded.backend.root)
+    assert reopened.backend.mode == "sqlite_sharded"
+    assert reopened.store.verify().result.ok == len(live)
+    assert reopened.get_profile("zstd_dict").zstd_dict_id == train.dict_id
+    assert_repo_consistent(reopened)
+
+
+def test_sharded_repeated_upsert_and_meta(repo_sharded):
+    novel = repo_sharded.create_novel("Sharded Repeat")
+    first = repo_sharded.upsert_chapter(novel, "k", b"v1" * 100, "raw")
+    second = repo_sharded.upsert_chapter(novel, "k", b"v2" * 100, "raw")
+    assert first == second
+    assert repo_sharded.get_chapter_bytes(second) == b"v2" * 100
+    repo_sharded.meta_set("chapter", second, "k", 1)
+    repo_sharded.meta_set("chapter", second, "k", 2)
+    assert repo_sharded.meta_get("chapter", second, "k") == 2
+    with repo_sharded.backend.txn(write=False) as conn:
+        count = int(conn.execute("SELECT COUNT(*) FROM chapters").fetchone()[0])
+    assert count == 1
+    assert_repo_consistent(repo_sharded)

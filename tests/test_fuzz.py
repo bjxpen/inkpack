@@ -10,7 +10,7 @@ import pytest
 from hypothesis import HealthCheck, given, settings
 from hypothesis import strategies as st
 
-from inkpack import ContentRef
+from inkpack import ContentRef, Profile
 
 from .conftest import assert_repo_consistent, make_repo
 
@@ -124,10 +124,9 @@ def test_fuzz_random_operation_sequence(repo):
             profile = rng.choice(PROFILES)
             if dict_ids and rng.random() < 0.3:
                 profile = "zstd_dict"
-                profiles = repo.backend.config_get("profiles")
-                profiles.setdefault("zstd_dict", {"codec": "zstd", "params": {"level": 6}, "zstd_dict_id": None})
-                profiles["zstd_dict"]["zstd_dict_id"] = rng.choice(dict_ids)
-                repo.backend.config_set("profiles", profiles)
+                repo.set_profile(
+                    Profile(name="zstd_dict", codec="zstd", params={"level": 6}, zstd_dict_id=rng.choice(dict_ids))
+                )
             body = _random_body(rng, rng.randrange(0, 20_000))
             if rng.random() < 0.3:
                 result = repo.store.put_stream(io.BytesIO(body), profile=profile).result
@@ -246,9 +245,7 @@ def test_hypothesis_train_dict_roundtrip(repo_single, samples):
     train = repo_single.store.train_dict(samples).result
     assert train.dict_size > 0
     assert train.samples_used == len(samples)
-    profiles = repo_single.backend.config_get("profiles")
-    profiles["zstd_dict"] = {"codec": "zstd", "params": {"level": 6}, "zstd_dict_id": train.dict_id}
-    repo_single.backend.config_set("profiles", profiles)
+    repo_single.set_profile(Profile(name="zstd_dict", codec="zstd", params={"level": 6}, zstd_dict_id=train.dict_id))
     probe = samples[0] * 3
     put = repo_single.store.put_bytes(probe, profile="zstd_dict").result
     assert put.zstd_dict_id is not None  # may be a dedupe hit from an earlier example

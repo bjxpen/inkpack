@@ -32,33 +32,14 @@ from .types import (
     ReencodeResult,
     TrainDictResult,
     VerifyResult,
+    profiles_to_config,
+    validate_profiles,
 )
 
 __version__ = "0.1.0"
 
 DEFAULT_SHARD_CAP_BYTES = 2 << 30
 DEFAULT_SHARD_MIN_BYTES = 256 << 20
-
-
-def _validate_profile_entry(name: Any, profile: Any) -> Profile:
-    """Runtime validation of caller-supplied profile definitions."""
-    if not isinstance(name, str):
-        raise TypeError("profile names must be strings")
-    if not isinstance(profile, Profile):
-        raise TypeError(f"profile {name!r} must be a Profile instance")
-    if profile.name != name:
-        raise ValueError(f"profile key {name!r} does not match Profile.name {profile.name!r}")
-    if profile.codec not in ("none", "zstd"):
-        raise ValueError(f"profile {name!r}: unsupported codec {profile.codec!r}")
-    if profile.zstd_dict_id is not None and profile.codec != "zstd":
-        raise ValueError(f"profile {name!r}: zstd_dict_id requires codec 'zstd'")
-    return profile
-
-
-def _validate_profiles(profiles: dict[str, Profile] | None) -> dict[str, Profile]:
-    if not profiles:
-        raise ValueError("at least one profile is required")
-    return {name: _validate_profile_entry(name, profile) for name, profile in profiles.items()}
 
 
 def _validate_stored_profiles(profiles: Any) -> dict[str, Any]:
@@ -103,7 +84,7 @@ def create_repo(
     clock: Clock | None = None,
 ) -> Repository:
     """Create a new repository (spec 4.4) and return a ready-to-use Repository."""
-    profiles = _validate_profiles(profiles)
+    profiles = validate_profiles(profiles)
     identity = identity or IKB1
     backend = SqliteBackend.open(
         path=path,
@@ -115,13 +96,7 @@ def create_repo(
     )
     backend.config_set("identity_policy", identity.name)
     backend.config_set("backend_mode", backend_mode)
-    backend.config_set(
-        "profiles",
-        {
-            name: {"codec": p.codec, "params": p.params, "zstd_dict_id": p.zstd_dict_id}
-            for name, p in profiles.items()
-        },
-    )
+    backend.config_set("profiles", profiles_to_config(profiles))
     backend.config_set("verify_on_read", bool(verify_on_read))
     if backend_mode == "sqlite_sharded":
         backend.config_set("shard_cap_bytes", int(shard_cap_bytes))

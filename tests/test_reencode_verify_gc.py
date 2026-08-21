@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from inkpack import ContentRef, MissingContent
+from inkpack import ContentRef, MissingContent, Profile
 
 from .conftest import assert_repo_consistent, enc_row, payload_bytes, set_payload
 
@@ -44,9 +44,7 @@ def test_reencode_does_not_change_blob_key_and_verify_ok(repo):
 
 def test_reencode_follows_profile_definition_changes(repo):
     put = repo.store.put_bytes(b"profile-driven " * 300, profile="zstd_nodict").result
-    profiles = repo.backend.config_get("profiles")
-    profiles["zstd_nodict"] = {"codec": "none", "params": {}, "zstd_dict_id": None}
-    repo.backend.config_set("profiles", profiles)
+    repo.set_profile(Profile(name="zstd_nodict", codec="none", params={}))
     result = repo.store.reencode([put.ref]).result
     assert result.reencoded == 1
     assert enc_row(repo, put.ref)["codec"] == "none"
@@ -84,9 +82,7 @@ def test_reencode_option_validation(repo):
 
 def test_reencode_to_dict_profile_and_back(repo):
     train = repo.store.train_dict([b"cycle " * 100] * 5).result
-    profiles = repo.backend.config_get("profiles")
-    profiles["zstd_dict"] = {"codec": "zstd", "params": {"level": 6}, "zstd_dict_id": train.dict_id}
-    repo.backend.config_set("profiles", profiles)
+    repo.set_profile(Profile(name="zstd_dict", codec="zstd", params={"level": 6}, zstd_dict_id=train.dict_id))
     data = b"cycle " * 1000
     put = repo.store.put_bytes(data, profile="raw").result
     repo.store.reencode([put.ref], options={"profile": "zstd_dict"}).result

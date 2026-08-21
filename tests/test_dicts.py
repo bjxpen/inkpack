@@ -6,15 +6,13 @@ import json
 
 import pytest
 
-from inkpack import MissingContent
+from inkpack import MissingContent, Profile
 
 from .conftest import delete_dict, enc_row
 
 
 def _add_dict_profile(repo, dict_id: str, name: str = "zstd_dict", level: int = 6) -> None:
-    profiles = repo.backend.config_get("profiles")
-    profiles[name] = {"codec": "zstd", "params": {"level": level}, "zstd_dict_id": dict_id}
-    repo.backend.config_set("profiles", profiles)
+    repo.set_profile(Profile(name=name, codec="zstd", params={"level": level}, zstd_dict_id=dict_id))
 
 
 def test_train_dict_persists_row(repo):
@@ -93,9 +91,7 @@ def test_profile_dict_id_swap_changes_encoding_not_decoding(repo):
     assert put.zstd_dict_id == train_a.dict_id
     # Redefine the profile to use a different dict; decoding must still work
     # and reencode must migrate the stored row to the new dict.
-    profiles = repo.backend.config_get("profiles")
-    profiles["zstd_dict"]["zstd_dict_id"] = train_b.dict_id
-    repo.backend.config_set("profiles", profiles)
+    repo.set_profile(Profile(name="zstd_dict", codec="zstd", params={"level": 6}, zstd_dict_id=train_b.dict_id))
     assert repo.store.get_bytes(put.ref) == data
     repo.store.reencode([put.ref]).result
     assert enc_row(repo, put.ref)["zstd_dict_id"] == train_b.dict_id

@@ -7,7 +7,7 @@ import os
 
 import pytest
 
-from inkpack import ContentRef, CorruptContent, MissingContent, open_repo
+from inkpack import ContentRef, CorruptContent, MissingContent, Profile, open_repo
 
 from .conftest import CANONICAL_SAMPLES, NonseekableBytesIO, make_repo, set_payload
 
@@ -56,9 +56,7 @@ def test_put_unknown_profile_raises(repo):
 
 
 def test_put_with_missing_dict_raises(repo):
-    profiles = repo.backend.config_get("profiles")
-    profiles["broken"] = {"codec": "zstd", "params": {"level": 3}, "zstd_dict_id": "ikd1:does-not-exist"}
-    repo.backend.config_set("profiles", profiles)
+    repo.set_profile(Profile(name="broken", codec="zstd", params={"level": 3}, zstd_dict_id="ikd1:does-not-exist"))
     with pytest.raises(MissingContent):
         repo.store.put_bytes(b"x" * 100, profile="broken").result
 
@@ -84,9 +82,7 @@ def test_get_missing_payload_raises(repo):
 def test_get_missing_dict_raises_and_verify_counts_missing(repo):
     """Decision C: missing dictionary => MissingContent (not corrupt)."""
     train = repo.store.train_dict([b"dict-sample " * 50] * 5).result
-    profiles = repo.backend.config_get("profiles")
-    profiles["zstd_dict"] = {"codec": "zstd", "params": {"level": 3}, "zstd_dict_id": train.dict_id}
-    repo.backend.config_set("profiles", profiles)
+    repo.set_profile(Profile(name="zstd_dict", codec="zstd", params={"level": 3}, zstd_dict_id=train.dict_id))
     put = repo.store.put_bytes(b"dict-sample " * 200, profile="zstd_dict").result
     assert put.zstd_dict_id == train.dict_id
 
@@ -122,19 +118,14 @@ def test_decode_uses_stored_encoding_metadata_not_profile(repo):
     """Spec 6.2 MUST: profile changes must not affect decoding."""
     data = b"hello world " * 500
     put = repo.store.put_bytes(data, profile="zstd_nodict").result
-    profiles = repo.backend.config_get("profiles")
-    profiles["zstd_nodict"] = {"codec": "none", "params": {}, "zstd_dict_id": None}
-    repo.backend.config_set("profiles", profiles)
+    repo.set_profile(Profile(name="zstd_nodict", codec="none", params={}))
     assert repo.store.get_bytes(put.ref) == data
     # Same for dict-based content: dropping the dict from the profile is fine,
     # the stored zstd_dict_id remains authoritative.
     train = repo.store.train_dict([b"dict-word " * 50] * 5).result
-    profiles = repo.backend.config_get("profiles")
-    profiles["zstd_dict"] = {"codec": "zstd", "params": {"level": 3}, "zstd_dict_id": train.dict_id}
-    repo.backend.config_set("profiles", profiles)
+    repo.set_profile(Profile(name="zstd_dict", codec="zstd", params={"level": 3}, zstd_dict_id=train.dict_id))
     dput = repo.store.put_bytes(b"dict-word " * 200, profile="zstd_dict").result
-    profiles["zstd_dict"]["zstd_dict_id"] = None
-    repo.backend.config_set("profiles", profiles)
+    repo.set_profile(Profile(name="zstd_dict", codec="zstd", params={"level": 3}))
     assert repo.store.get_bytes(dput.ref) == b"dict-word " * 200
 
 

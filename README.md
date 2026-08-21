@@ -24,9 +24,10 @@ The public API is deliberately small, and long operations report progress via
   dictionaries, backed by the real [`zstandard`](https://github.com/facebook/zstd/tree/main/contrib/python-zstandard)
   library).
 - **Profiles** — named write policies (`codec`, `params`, optional
-  `zstd_dict_id`) stored in the repo config. Profiles decide how *new* writes
-  are encoded; decoding always uses the **stored encoding metadata**, so
-  profile changes never break existing content.
+  `zstd_dict_id`) stored in the repo config, managed through validated
+  wrappers on `Repository` (`get_profiles`, `set_profile`, …). Profiles
+  decide how *new* writes are encoded; decoding always uses the **stored
+  encoding metadata**, so profile changes never break existing content.
 - **Two backends**
   - `sqlite_single` — one `repo.sqlite` file (WAL).
   - `sqlite_sharded` — `index.sqlite` + `payload/shard-0001.sqlite …` with a
@@ -96,10 +97,7 @@ repo.meta_list("chapter", chapter_id)        # {"words": 4200, ...}
 
 # --- dictionaries ---------------------------------------------------------
 trained = store.train_dict([b"sample prose " * 100] * 5).result
-profiles = repo.backend.config_get("profiles")
-profiles["zstd_dict"] = {"codec": "zstd", "params": {"level": 6},
-                         "zstd_dict_id": trained.dict_id}
-repo.backend.config_set("profiles", profiles)
+repo.set_profile(Profile("zstd_dict", "zstd", {"level": 6}, trained.dict_id))
 put = store.put_bytes(b"sample prose " * 2000, profile="zstd_dict").result
 assert put.zstd_dict_id == trained.dict_id
 
@@ -174,6 +172,27 @@ Profile(name="zstd_dict", codec="zstd", params={"level": 6}, zstd_dict_id="ikd1:
 redefine or delete profiles without breaking stored content; `reencode()`
 is what migrates stored content to a new policy.
 
+### Profile management on `Repository`
+
+Normal usage never needs `repo.backend.config_get/set("profiles", ...)` —
+`Repository` exposes small validated wrappers:
+
+```python
+repo.get_profiles()                              # dict[str, Profile]
+repo.get_profile("zstd_dict")                    # Profile; KeyError if unknown
+repo.set_profile(Profile("zstd_dict", "zstd", {"level": 6}, trained.dict_id))  # add/replace one
+repo.set_profiles({"raw": Profile("raw", "none", {})})  # replace the whole set
+```
+
+- `set_profile` / `set_profiles` validate exactly like `create_repo` (codec
+  must be `"none"`/`"zstd"`, `zstd_dict_id` only with `zstd`, profile key
+  must match `Profile.name`), so invalid definitions fail fast at set time
+  instead of surfacing later at write time.
+- `set_profiles` requires a non-empty set.
+- Replacing or removing profiles never breaks stored content — decoding uses
+  stored encoding metadata, not the profile set (spec §6.2). Use
+  `reencode()` to migrate existing content to a changed policy.
+
 ### `train_dict` options
 
 - `{"dict_size": 4096}` — target dictionary size in bytes
@@ -238,17 +257,25 @@ chapter_ids = [repo.upsert_chapter(novel_id, f"{i:04d}", body, "raw") for i, bod
 samples = [repo.get_chapter_bytes(cid) for cid in chapter_ids]
 train = repo.store.train_dict(samples).result                     # dict from the novel's own prose
 
-profiles = repo.backend.config_get("profiles")
-profiles["zstd_dict"] = {"codec": "zstd", "params": {"level": 6}, "zstd_dict_id": train.dict_id}
-repo.backend.config_set("profiles", profiles)
+repo.set_profile(Profile("zstd_dict", "zstd", {"level": 6}, train.dict_id))
 
 refs = list(repo.iter_live_content(scope=novel_id))
 repo.store.reencode(refs, options={"profile": "zstd_dict"}).result  # shrink in place
 ```
 
 **One dictionary per novel:** train separately from each novel's chapters,
-point each novel's profile at its own dict id, and reencode per novel (see
-`tests/test_workflows.py::test_per_novel_dictionaries` — a novel's own
+point each novel's profile at its own dict id, and reencode per novel:
+
+```python
+train_a = store.train_dict([repo.get_chapter_bytes(cid) for cid in chapters_a]).result
+train_b = store.train_dict([repo.get_chapter_bytes(cid) for cid in chapters_b]).result
+repo.set_profile(Profile("zstd_dict_A", "zstd", {"level": 6}, train_a.dict_id))
+repo.set_profile(Profile("zstd_dict_B", "zstd", {"level": 6}, train_b.dict_id))
+store.reencode(list(repo.iter_live_content(scope=novel_a)), options={"profile": "zstd_dict_A"}).result
+store.reencode(list(repo.iter_live_content(scope=novel_b)), options={"profile": "zstd_dict_B"}).result
+```
+
+(see `tests/test_workflows.py::test_per_novel_dictionaries` — a novel's own
 dictionary compresses its prose measurably better than another novel's
 dictionary, and decoding always uses the dictionary recorded in the stored
 encoding row).

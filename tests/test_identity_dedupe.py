@@ -7,7 +7,7 @@ import re
 
 import pytest
 
-from inkpack import ContentRef
+from inkpack import ContentRef, Profile
 from inkpack.codec import (
     blob_key_ikb1_bytes,
     blob_key_ikb1_from_chunks,
@@ -95,9 +95,7 @@ def test_dedupe_hit_reflects_stored_encoding(repo):
     data = b"dedupe-reflection" * 200
     first = repo.store.put_bytes(data, profile="zstd_nodict").result
     assert first.codec == "zstd"
-    profiles = repo.backend.config_get("profiles")
-    profiles["zstd_nodict"] = {"codec": "none", "params": {}, "zstd_dict_id": None}
-    repo.backend.config_set("profiles", profiles)
+    repo.set_profile(Profile(name="zstd_nodict", codec="none", params={}))
     second = repo.store.put_bytes(data, profile="zstd_nodict").result
     assert second.codec == "zstd"  # stored metadata, not the mutated profile
     assert second.stored_len == first.stored_len

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 
+from inkpack import Profile
+
 from .conftest import enc_row, payload_bytes
 
 
@@ -21,9 +23,7 @@ def test_codec_params_json_is_canonical(repo):
 
 
 def test_none_codec_stores_empty_params_even_if_profile_has_params(repo):
-    profiles = repo.backend.config_get("profiles")
-    profiles["raw_noisy"] = {"codec": "none", "params": {"irrelevant": True}, "zstd_dict_id": None}
-    repo.backend.config_set("profiles", profiles)
+    repo.set_profile(Profile(name="raw_noisy", codec="none", params={"irrelevant": True}))
     put = repo.store.put_bytes(b"noisy", profile="raw_noisy").result
     row = enc_row(repo, put.ref)
     assert row["codec_params_json"] == "{}"
@@ -55,9 +55,7 @@ def test_zstd_dict_id_null_unless_zstd_dict_used(repo):
     assert enc_row(repo, plain.ref)["codec"] == "zstd"
 
     train = repo.store.train_dict([b"dicty " * 100] * 5).result
-    profiles = repo.backend.config_get("profiles")
-    profiles["zstd_dict"] = {"codec": "zstd", "params": {"level": 6}, "zstd_dict_id": train.dict_id}
-    repo.backend.config_set("profiles", profiles)
+    repo.set_profile(Profile(name="zstd_dict", codec="zstd", params={"level": 6}, zstd_dict_id=train.dict_id))
     dicted = repo.store.put_bytes(b"dicty " * 400, profile="zstd_dict").result
     assert enc_row(repo, dicted.ref)["zstd_dict_id"] == train.dict_id
 

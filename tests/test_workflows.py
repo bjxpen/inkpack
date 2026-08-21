@@ -21,6 +21,7 @@ from inkpack import (
     CorruptContent,
     MissingContent,
     OpEvent,
+    Profile,
 )
 
 from .conftest import assert_repo_consistent, enc_row
@@ -34,11 +35,7 @@ def _chapter_text(rng: random.Random, words: list[str], n: int = 60) -> bytes:
     return " ".join(rng.choice(words) for _ in range(n)).encode()
 
 
-def _put_profiles(repo, extra: dict[str, dict]) -> None:
-    """Merge ad-hoc profile definitions into the repo config."""
-    profiles = repo.backend.config_get("profiles")
-    profiles.update(extra)
-    repo.backend.config_set("profiles", profiles)
+
 
 
 def _stored_len(repo, ref: ContentRef) -> int:
@@ -48,7 +45,7 @@ def _stored_len(repo, ref: ContentRef) -> int:
 
 
 def _set_dict_profile(repo, name: str, dict_id: str, level: int = 6) -> None:
-    _put_profiles(repo, {name: {"codec": "zstd", "params": {"level": level}, "zstd_dict_id": dict_id}})
+    repo.set_profile(Profile(name=name, codec="zstd", params={"level": level}, zstd_dict_id=dict_id))
 
 
 def _sum_stored(repo, refs) -> int:
@@ -367,11 +364,11 @@ def test_train_dict_unknown_option(repo):
 
 
 def test_put_with_invalid_zstd_level_is_typed_error(repo):
-    _put_profiles(repo, {"bad_level": {"codec": "zstd", "params": {"level": 99}, "zstd_dict_id": None}})
+    repo.set_profile(Profile(name="bad_level", codec="zstd", params={"level": 99}))
     with pytest.raises(ValueError) as exc:
         repo.store.put_bytes(b"x" * 100, profile="bad_level").result
     assert "level" in str(exc.value)
-    _put_profiles(repo, {"str_level": {"codec": "zstd", "params": {"level": "3"}, "zstd_dict_id": None}})
+    repo.set_profile(Profile(name="str_level", codec="zstd", params={"level": "3"}))
     with pytest.raises(ValueError):
         repo.store.put_bytes(b"x" * 100, profile="str_level").result
 
@@ -383,8 +380,19 @@ def test_reencode_with_invalid_zstd_level_is_typed_error(repo):
     assert "level" in str(exc.value)
 
 
-def test_put_with_unsupported_codec_is_typed_error(repo):
-    _put_profiles(repo, {"lzma": {"codec": "lzma", "params": {}, "zstd_dict_id": None}})
+def test_unsupported_codec_rejected_by_profile_wrapper(repo):
+    # The wrapper validates eagerly: a bad codec can never enter the config.
+    with pytest.raises(ValueError) as exc:
+        repo.set_profile(Profile(name="lzma", codec="lzma", params={}))
+    assert "unsupported codec" in str(exc.value)
+
+
+def test_unsupported_codec_still_typed_if_injected_raw(repo):
+    # Defense in depth: even a malformed profile injected behind the wrapper's
+    # back surfaces as a typed ValueError at write time.
+    profiles = repo.backend.config_get("profiles")
+    profiles["lzma"] = {"codec": "lzma", "params": {}, "zstd_dict_id": None}
+    repo.backend.config_set("profiles", profiles)
     with pytest.raises(ValueError) as exc:
         repo.store.put_bytes(b"x", profile="lzma").result
     assert "unsupported codec" in str(exc.value)
@@ -404,7 +412,7 @@ def test_decode_failure_is_corruptcontent_not_raw_zstd(repo):
 
 
 def test_missing_dictionary_is_missingcontent(repo):
-    _put_profiles(repo, {"ghost_dict": {"codec": "zstd", "params": {}, "zstd_dict_id": "ikd1:nope"}})
+    repo.set_profile(Profile(name="ghost_dict", codec="zstd", params={}, zstd_dict_id="ikd1:nope"))
     with pytest.raises(MissingContent) as exc:
         repo.store.put_bytes(b"x" * 100, profile="ghost_dict").result
     assert "dictionary" in str(exc.value)

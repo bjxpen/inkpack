@@ -30,6 +30,7 @@ from .types import (
     TrainDictResult,
     VerifyResult,
     check_cancel,
+    profiles_from_config,
 )
 
 _READ_CHUNK = 128 * 1024
@@ -53,19 +54,10 @@ class BlobStore:
     # -- helpers ------------------------------------------------------------
 
     def _profile(self, name: str) -> Profile:
-        raw = self.backend.config_get("profiles")
-        if not isinstance(raw, dict):
+        profiles = profiles_from_config(self.backend.config_get("profiles"))
+        if name not in profiles:
             raise KeyError(f"profile not found: {name}")
-        cfg = cast("dict[str, Any]", raw).get(name)
-        if not isinstance(cfg, dict):
-            raise KeyError(f"profile not found: {name}")
-        cfg = cast("dict[str, Any]", cfg)
-        return Profile(
-            name=name,
-            codec=str(cfg.get("codec")),
-            params=cast("dict[str, Any]", cfg.get("params") or {}),
-            zstd_dict_id=cfg.get("zstd_dict_id"),
-        )
+        return profiles[name]
 
     def _load_dict(self, profile: Profile) -> bytes | None:
         if profile.zstd_dict_id is None:

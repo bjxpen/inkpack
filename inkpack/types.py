@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
-from typing import Any, Generic, Literal, Protocol, TypeVar
+from typing import Any, Generic, Literal, Protocol, TypeVar, cast
 
 T = TypeVar("T")
 
@@ -175,6 +175,67 @@ class Profile:
     codec: str
     params: dict[str, Any] = field(default_factory=dict[str, Any])
     zstd_dict_id: str | None = None
+
+
+# -- profile config serialization -------------------------------------------
+# Shared by Repository's profile wrappers, BlobStore and create_repo, so the
+# stored `repo_config["profiles"]` shape has exactly one converter pair.
+
+
+def profiles_to_config(profiles: dict[str, Profile]) -> dict[str, dict[str, Any]]:
+    """Serialize ``Profile`` objects into the ``repo_config["profiles"]`` shape."""
+    return {
+        name: {"codec": p.codec, "params": p.params, "zstd_dict_id": p.zstd_dict_id}
+        for name, p in profiles.items()
+    }
+
+
+def profiles_from_config(raw: Any) -> dict[str, Profile]:
+    """Parse the stored ``repo_config["profiles"]`` value into ``Profile`` objects."""
+    mapping = cast("dict[str, Any]", raw) if isinstance(raw, dict) else None
+    if mapping is None:
+        return {}
+    out: dict[str, Profile] = {}
+    for name, cfg in mapping.items():
+        if not isinstance(cfg, dict):
+            continue
+        cfg = cast("dict[str, Any]", cfg)
+        params = cfg.get("params")
+        if not isinstance(params, dict):
+            params = {}
+        out[name] = Profile(
+            name=name,
+            codec=str(cfg.get("codec")),
+            params=cast("dict[str, Any]", params),
+            zstd_dict_id=cfg.get("zstd_dict_id"),
+        )
+    return out
+
+
+def _validate_profile_entry(name: Any, profile: Any) -> Profile:
+    """Validate one caller-supplied profile definition."""
+    if not isinstance(name, str):
+        raise TypeError("profile names must be strings")
+    if not isinstance(profile, Profile):
+        raise TypeError(f"profile {name!r} must be a Profile instance")
+    if profile.name != name:
+        raise ValueError(f"profile key {name!r} does not match Profile.name {profile.name!r}")
+    if profile.codec not in ("none", "zstd"):
+        raise ValueError(f"profile {name!r}: unsupported codec {profile.codec!r}")
+    if not isinstance(cast("Any", profile.params), dict):
+        raise TypeError(f"profile {name!r}: params must be a dict")
+    if profile.zstd_dict_id is not None and profile.codec != "zstd":
+        raise ValueError(f"profile {name!r}: zstd_dict_id requires codec 'zstd'")
+    return profile
+
+
+def validate_profiles(profiles: dict[str, Profile] | None) -> dict[str, Profile]:
+    """Validate a full profile set; at least one profile is required."""
+    if not profiles:
+        raise ValueError("at least one profile is required")
+    for name, profile in profiles.items():
+        _validate_profile_entry(name, profile)
+    return profiles
 
 
 class Clock(Protocol):
