@@ -204,3 +204,38 @@ def hold_write_lock(index_path) -> sqlite3.Connection:
     conn = sqlite3.connect(str(index_path))
     conn.execute("BEGIN EXCLUSIVE")
     return conn
+
+
+@pytest.fixture
+def connect_counter(monkeypatch):
+    """Count opens via connect_file; track liveness via a Connection subclass
+    (sqlite3.Connection is immutable, so the factory subclass is the hook)."""
+    import sqlite3
+
+    import inkpack.sqlite as sqlite_mod
+
+    state = {"opens": 0, "live": 0}
+    original_connect = sqlite3.connect
+
+    class TrackedConnection(sqlite3.Connection):
+        def close(self):
+            if not getattr(self, "_inkpack_closed_tracked", False):
+                self._inkpack_closed_tracked = True
+                state["live"] -= 1
+            super().close()
+
+    def tracked_connect(*args, **kwargs):
+        kwargs["factory"] = TrackedConnection
+        conn = original_connect(*args, **kwargs)
+        state["live"] += 1
+        return conn
+
+    monkeypatch.setattr(sqlite3, "connect", tracked_connect)
+    original = sqlite_mod.connect_file
+
+    def counting(path, busy_timeout_ms, synchronous="NORMAL", *, create=False):
+        state["opens"] += 1
+        return original(path, busy_timeout_ms, synchronous, create=create)
+
+    monkeypatch.setattr(sqlite_mod, "connect_file", counting)
+    return state

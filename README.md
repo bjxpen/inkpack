@@ -98,7 +98,7 @@ repo.meta_list("chapter", chapter_id)        # {"words": 4200, ...}
 # --- catalog (no bodies) ---------------------------------------------------
 novel = repo.get_novel(novel_id)             # dict row; NotFound if missing
 repo.update_novel(novel_id, title="…", slug="…")
-chapters = repo.list_chapters(novel_id)      # list[ChapterInfo], no bodies
+chapters = repo.list_chapters(novel_id)      # list[ChapterInfo], no bodies, ordered by order_key
 info = repo.get_chapter(chapter_id)          # ChapterInfo
 repo.delete_chapter(chapter_id)              # catalog only; then gc(iter_live_content())
 repo.delete_novel(novel_id, cascade=True)    # catalog only; content reclaimed by gc
@@ -146,6 +146,12 @@ result = op.result                               # after completion
 ```
 
 Operations are single-use: iterate once (or just read `.result`).
+
+`op.close()` abandons an operation early and **immediately** releases its
+resources (e.g. the operation-scoped database session) instead of waiting for
+garbage collection; `.result` afterwards raises `Cancelled`. Stream puts
+(`put_stream`, `upsert_chapter_stream`) emit `progress` events **live** while
+the source stream is being hashed.
 
 ### Operation reference
 
@@ -221,8 +227,11 @@ never at the first `put`.
 
 `reencode(targets)` re-encodes each target in place (same
 `(blob_key, profile)` key; payload + encoding metadata updated in one
-transaction, spec §7.5) using the target's *current* profile definition. To
-override the policy without touching profile definitions:
+transaction, spec §7.5) using the target's *current* profile definition.
+Per-target data problems (missing payload/dict, corrupt payload, deleted
+profile) **skip that target and continue** — a `log` event names the reason —
+so one bad chapter never aborts a bulk recompression. To override the policy
+without touching profile definitions:
 
 - `{"profile": "other"}` — use `other`'s policy for all targets;
 - `{"codec": "zstd", "params": {"level": 9}, "zstd_dict_id": None}` —
@@ -233,7 +242,10 @@ Unknown option keys, or `profile` combined with `codec`/`params`/
 
 ### `compact` options
 
-- `{"shard_ids": [1, 2]}` — vacuum only those shards (plus the index).
+- `{"shard_ids": [1, 2]}` — vacuum only those shards (plus the index);
+  an **empty** list vacuums the index only, unknown ids raise `ValueError`
+  (compact never creates a shard file), and `shard_ids` in `sqlite_single`
+  mode raises `ValueError`.
   Default: index + all shards. `VACUUM` runs on a connection with no attached
   databases.
 
@@ -244,8 +256,8 @@ Unknown option keys, or `profile` combined with `codec`/`params`/
 | Error | Raised when |
 | --- | --- |
 | `InkpackError` | base class for all Inkpack errors; also config/layout problems on `open_repo` |
-| `NotFound` | a referenced entity (e.g. novel) does not exist |
-| `MissingContent` | encoding row, payload row, or required dictionary is missing |
+| `NotFound` | a referenced entity does not exist — novels, chapters (catalog rows), or a missing repository on `open_repo` |
+| `MissingContent` | stored content is missing — encoding row, payload row, or required dictionary |
 | `CorruptContent` | payload fails to decode, or identity mismatch under `verify_on_read` |
 | `Busy` | a writer operation times out on a locked database (SQLite busy/locked) |
 | `Cancelled` | a cancel token requested abort |
@@ -330,8 +342,14 @@ DBs). Key invariants:
   "repaired".
 - Dedupe hits (decision E) never rewrite payload/encodings/`updated_at`; if
   the payload row is missing, `put_*` **repairs** it by re-encoding with the
-  *stored* policy (never the current profile), and raises `MissingContent`
-  when the stored dictionary is gone.
+  *stored* policy (never the current profile) — and the same repair applies
+  to `upsert_chapter`, so a chapter never commits pointing at missing
+  content. A hit with a missing required dictionary raises `MissingContent`
+  ("put succeeded" implies "content is readable"); a stored key whose
+  `blob_key` does not match the content is rejected (`CorruptContent`).
+- GC keeps dictionaries referenced by **profiles** in `repo_config` alive
+  (spec §9 amendment), so `train_dict → set_profile → gc → put` never loses
+  the dictionary; drop the profile reference and GC reclaims it.
 - `encodings.stored_len` always equals `len(payload.data)`.
 - `encodings.zstd_dict_id` is `NULL` unless `codec == "zstd"` and a dict was
   used; dictionaries live only in the index DB.

@@ -104,6 +104,16 @@ def test_gc_deletes_unreferenced_dicts_by_default(repo):
     put = repo.store.put_bytes(b"gc-dict " * 300, profile="zstd_dict").result
     gc = repo.store.gc(live=[put.ref]).result
     assert gc.dicts_deleted == 0  # still referenced
+    # The profile still references the dict: GC must keep it (review §4.1
+    # Option B) so the documented train -> set_profile -> gc -> put workflow
+    # does not lose the dictionary.
+    gc = repo.store.gc(live=[]).result
+    assert gc.dicts_deleted == 0
+    with repo.backend.txn(write=False) as conn:
+        row = conn.execute("SELECT 1 FROM dicts WHERE dict_id=?", (train.dict_id,)).fetchone()
+    assert row is not None
+    # Drop the profile reference, then GC reclaims the dict.
+    repo.set_profile(Profile(name="zstd_dict", codec="zstd", params={"level": 6}))
     gc = repo.store.gc(live=[]).result
     assert gc.dicts_deleted == 1
     with repo.backend.txn(write=False) as conn:
@@ -118,12 +128,14 @@ def test_missing_dict_then_reencode_restores(repo):
     delete_dict(repo, train.dict_id)
     with pytest.raises(MissingContent):
         repo.store.get_bytes(put.ref)
-    with pytest.raises(MissingContent):
-        repo.store.reencode([put.ref]).result
+    # Reencode skips the unreadable target instead of aborting (review P1-3).
+    skipped = repo.store.reencode([put.ref]).result
+    assert skipped.skipped == 1 and skipped.reencoded == 0
     # Re-training the same dict and re-running reencode repairs the repo.
     again = repo.store.train_dict([b"restore " * 100] * 5).result
     assert again.dict_id == train.dict_id
-    repo.store.reencode([put.ref]).result
+    result = repo.store.reencode([put.ref]).result
+    assert result.reencoded == 1
     assert repo.store.get_bytes(put.ref) == b"restore " * 300
 
 

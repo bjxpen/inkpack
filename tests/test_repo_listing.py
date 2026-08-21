@@ -23,8 +23,9 @@ def test_list_chapters_order_and_fields(repo):
     repo.upsert_chapter(novel_id, "002", b"two", "raw")
     repo.upsert_chapter(novel_id, "001", b"one", "zstd_nodict", hints={"charset": "utf-8"})
     chapters = repo.list_chapters(novel_id)
-    assert [c.order_key for c in chapters] == ["002", "001"]  # ORDER BY id
-    info = chapters[1]
+    # Catalog ordering is by order_key (text sort, review P1-7).
+    assert [c.order_key for c in chapters] == ["001", "002"]
+    info = chapters[0]
     assert isinstance(info, ChapterInfo)
     assert info.novel_id == novel_id
     assert info.profile == "zstd_nodict"

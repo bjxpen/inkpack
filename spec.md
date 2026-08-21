@@ -305,6 +305,14 @@ Shard sizing:
 - A given `(blob_key, profile)` payload row exists in at most one shard.
 - `encodings.shard_id` is authoritative for locating it.
 
+**No-create on open/read/compact (MUST, normative):** opening, reading,
+validating and compacting an existing repository MUST NOT create SQLite
+files or directories. Only explicit creation paths (`create_repo`,
+`SqliteBackend.create`, shard rollover during a write) may create files. A
+missing index DB is `NotFound`; a missing shard file behaves like missing
+content (`MissingContent`); `compact()` rejects unknown shard ids instead of
+creating empty shard files.
+
 Recommended:
 - `foreign_keys=ON` in index DB
 - `synchronous=NORMAL` default (configurable)
@@ -316,7 +324,11 @@ Recommended:
 
 - Dicts are stored only in index DB.
 - `zstd_dict_id` MUST reflect actual dict usage.
-- `gc()` MUST remove unreferenced dicts by default.
+- `gc()` MUST remove unreferenced dicts by default. "Unreferenced" means: not
+  referenced by any `encodings.zstd_dict_id` **and** not referenced by any
+  profile in `repo_config["profiles"]` (amendment: profile-referenced dicts
+  are live, so the documented `train_dict → set_profile → gc → put` workflow
+  never loses the dictionary).
 
 ---
 
@@ -332,9 +344,13 @@ Recommended:
 ### 10.2 gc(live_refs)
 `gc(live)` MUST:
 - delete encodings not in live set
-- delete corresponding payload rows
+- delete corresponding payload rows (grouped by `encodings.shard_id`, not by
+  the filesystem shard list: rows with `shard_id IS NULL` or a missing shard
+  file have their encodings row deleted without creating any file; the
+  NULL-locator group's payload rows are cleaned from every existing shard)
 - delete blobs with no remaining encodings (default)
-- delete dicts not referenced by any encoding (default)
+- delete dicts not referenced by any encoding AND not referenced by any
+  profile in `repo_config["profiles"]` (default)
 
 GC is a writer operation; if DB is locked/timeout, raise `Busy`.
 
@@ -1466,6 +1482,17 @@ If `(blob_key, profile)` already exists in `encodings`:
 2. Returned `PutResult` MUST reflect the **stored encoding row**:
    - `codec`, `stored_len`, `zstd_dict_id` from `encodings`
    - `raw_len` from `blobs.raw_len` (or derived from blob_key)
+3. **Readability precondition (amendment):** a dedupe hit MUST NOT report
+   success when the content is unreadable — if the stored row's
+   `zstd_dict_id` is set and the `dicts` row is missing, `put_*` MUST raise
+   `MissingContent` (without rewriting anything). "put succeeded" implies
+   "content is readable".
+4. **Repair (amendment):** if the encoding row exists but the payload row is
+   missing, `put_*` MUST repair the payload by re-encoding `raw` with the
+   **stored** codec/params/dict (never the current profile), keeping the same
+   `(blob_key, profile)` and `shard_id`. If the stored dict is missing, raise
+   `MissingContent`. The same rule applies to `upsert_chapter`-style atomic
+   persists: a chapter must never commit pointing at missing content.
 
 **Rationale:** Profiles can change; stored encoding metadata is authoritative.
 

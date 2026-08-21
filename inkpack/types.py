@@ -9,6 +9,7 @@ internal and performs no sqlite/zstd work.
 from __future__ import annotations
 
 from collections.abc import Callable, Generator, Iterator, Mapping
+from contextlib import suppress
 from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any, Generic, Literal, Protocol, TypeVar, cast
@@ -54,7 +55,7 @@ class Operation(Generic[T]):
 
     def __init__(self, iterator_factory: Callable[[], Generator[OpEvent, None, T]]) -> None:
         self._iterator_factory = iterator_factory
-        self._iterator: Iterator[OpEvent] | None = None
+        self._iterator: Generator[OpEvent, None, T] | None = None
         self._result: T | None = None
         self._error: BaseException | None = None
         self._done = False
@@ -78,11 +79,33 @@ class Operation(Generic[T]):
                     return
                 yield event
         except GeneratorExit:
+            # The consumer abandoned iteration: close the inner generator
+            # deterministically so its finally blocks (session teardown) run
+            # now instead of at an unspecified GC time (review P2-5).
+            iterator.close()
             raise
         except BaseException as exc:
             self._error = exc
             self._done = True
             raise
+
+    def close(self) -> None:
+        """Abandon the operation early, releasing any resources (e.g. the
+        operation-scoped database session) immediately.
+
+        Safe to call multiple times and on never-started operations. After
+        closing, ``.result`` raises :class:`Cancelled`.
+        """
+        if self._done:
+            return
+        if self._iterator is not None:
+            self._iterator.close()
+        self._done = True
+        self._error = Cancelled("operation closed before completion")
+
+    def __del__(self) -> None:
+        with suppress(Exception):
+            self.close()
 
     @property
     def result(self) -> T:
@@ -252,9 +275,11 @@ def profiles_from_config(raw: Any) -> dict[str, Profile]:
     (codec membership, dict-only-with-zstd, key/name match) is done by
     :func:`validate_profiles`.
     """
-    mapping = cast("dict[str, Any]", raw) if isinstance(raw, dict) else None
-    if mapping is None:
-        return {}
+    if not isinstance(raw, dict):
+        # Strict at the top level too (review P1-2): a non-dict stored value is
+        # repo corruption, never silently treated as "no profiles".
+        raise InkpackError("invalid repo config: profiles must be a dict")
+    mapping = cast("dict[str, Any]", raw)
     out: dict[str, Profile] = {}
     for name, cfg in mapping.items():
         if not isinstance(cfg, dict):
@@ -280,7 +305,12 @@ def profiles_from_config(raw: Any) -> dict[str, Profile]:
 
 
 def validate_profile_entry(name: Any, profile: Any) -> Profile:
-    """Validate one caller-supplied profile definition."""
+    """Validate one caller-supplied profile definition.
+
+    Includes codec-specific param constraints (review P2-7): ``zstd`` accepts
+    only a ``level`` key, an integer in 1..22, so invalid policies fail at
+    set/open time instead of surfacing later at encode time.
+    """
     if not isinstance(name, str):
         raise TypeError("profile names must be strings")
     if not isinstance(profile, Profile):
@@ -291,6 +321,14 @@ def validate_profile_entry(name: Any, profile: Any) -> Profile:
         raise ValueError(f"profile {name!r}: unsupported codec {profile.codec!r}")
     if profile.zstd_dict_id is not None and profile.codec != "zstd":
         raise ValueError(f"profile {name!r}: zstd_dict_id requires codec 'zstd'")
+    if profile.codec == "zstd":
+        params = dict(profile.params)
+        unknown = set(params) - {"level"}
+        if unknown:
+            raise ValueError(f"profile {name!r}: unknown zstd params {sorted(unknown)} (allowed: level)")
+        level = params.get("level", 6)
+        if not isinstance(level, int) or isinstance(level, bool) or not 1 <= level <= 22:
+            raise ValueError(f"profile {name!r}: zstd level must be an integer in 1..22, got {level!r}")
     return profile
 
 

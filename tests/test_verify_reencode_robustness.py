@@ -102,10 +102,11 @@ def test_reencode_override_none_roundtrip(repo):
 def test_reencode_override_zstd_missing_dict(repo):
     put = repo.store.put_bytes(b"missing-dict" * 30, profile="raw").result
     before = enc_row(repo, put.ref)
-    with pytest.raises(MissingContent):
-        repo.store.reencode(
-            [put.ref], options={"codec": "zstd", "zstd_dict_id": "ikd1:missing"}
-        ).result
+    # Per-target data problems skip instead of aborting (review P1-3).
+    result = repo.store.reencode(
+        [put.ref], options={"codec": "zstd", "zstd_dict_id": "ikd1:missing"}
+    ).result
+    assert result.skipped == 1 and result.reencoded == 0
     after = enc_row(repo, put.ref)
     assert after["codec"] == before["codec"]  # no half-update (spec 7.5)
     assert repo.store.get_bytes(put.ref) == b"missing-dict" * 30

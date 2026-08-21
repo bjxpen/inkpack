@@ -363,14 +363,23 @@ def test_train_dict_unknown_option(repo):
     assert "bogus" in str(exc.value)
 
 
-def test_put_with_invalid_zstd_level_is_typed_error(repo):
-    repo.set_profile(Profile(name="bad_level", codec="zstd", params={"level": 99}))
+def test_invalid_zstd_level_rejected_by_profile_wrapper(repo):
+    # Codec-specific param validation happens at set time (review P2-7).
+    with pytest.raises(ValueError) as exc:
+        repo.set_profile(Profile(name="bad_level", codec="zstd", params={"level": 99}))
+    assert "level" in str(exc.value)
+    with pytest.raises(ValueError):
+        repo.set_profile(Profile(name="str_level", codec="zstd", params={"level": "3"}))
+    with pytest.raises(ValueError):
+        repo.set_profile(Profile(name="bad_key", codec="zstd", params={"level": 3, "nope": 1}))
+    # Defense in depth: a bad level injected behind the wrapper's back still
+    # surfaces as a typed ValueError at write time.
+    profiles = repo.backend.config_get("profiles")
+    profiles["bad_level"] = {"codec": "zstd", "params": {"level": 99}, "zstd_dict_id": None}
+    repo.backend.config_set("profiles", profiles)
     with pytest.raises(ValueError) as exc:
         repo.store.put_bytes(b"x" * 100, profile="bad_level").result
     assert "level" in str(exc.value)
-    repo.set_profile(Profile(name="str_level", codec="zstd", params={"level": "3"}))
-    with pytest.raises(ValueError):
-        repo.store.put_bytes(b"x" * 100, profile="str_level").result
 
 
 def test_reencode_with_invalid_zstd_level_is_typed_error(repo):

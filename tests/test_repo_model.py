@@ -6,7 +6,7 @@ import io
 
 import pytest
 
-from inkpack import ContentRef, MissingContent, NotFound
+from inkpack import ContentRef, NotFound
 
 from .conftest import assert_repo_consistent
 
@@ -72,9 +72,10 @@ def test_upsert_chapter_missing_novel_raises(repo):
 
 
 def test_get_chapter_missing_raises(repo):
-    with pytest.raises(MissingContent):
+    # A missing catalog row is a catalog miss (review P1-6): NotFound.
+    with pytest.raises(NotFound):
         repo.get_chapter_bytes(999_999)
-    with pytest.raises(MissingContent):
+    with pytest.raises(NotFound):
         repo.open_chapter(999_999)
 
 

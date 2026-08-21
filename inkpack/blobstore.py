@@ -16,7 +16,7 @@ import io
 import json
 import sqlite3
 import tempfile
-from collections.abc import Callable, Generator, Iterable, Iterator
+from collections.abc import Generator, Iterable, Iterator
 from dataclasses import dataclass
 from typing import Any, BinaryIO, cast
 
@@ -86,15 +86,17 @@ class BlobStore:
         except KeyError:
             raise UnknownProfile(f"profile not found: {name}") from None
 
-    def _load_dict(self, profile: Profile) -> bytes | None:
-        """Load the profile's dictionary; codec-aware (review §4).
+    def _load_dict(self, profile: Profile, s: Session) -> bytes | None:
+        """Load the profile's dictionary on the operation session; codec-aware
+        (review §4, P2-1).
 
         A dict is only relevant for ``zstd``, so ``none`` never probes the
-        dict table even if a stale id is set.
+        dict table even if a stale id is set. Uses the session's dict cache so
+        one operation never re-reads the same dictionary.
         """
         if profile.codec != "zstd" or profile.zstd_dict_id is None:
             return None
-        dict_bytes = self.backend.get_dict(profile.zstd_dict_id)
+        dict_bytes = s.dict_bytes(profile.zstd_dict_id)
         if dict_bytes is None:
             raise MissingContent(
                 f"dictionary {profile.zstd_dict_id!r} referenced by profile {profile.name!r} is missing"
@@ -123,6 +125,12 @@ class BlobStore:
             blob_key, raw_len, _, _ = self.identity.key_bytes(raw)
         else:
             raw_len = len(raw)
+            # P0-5: a caller-supplied blob_key must be *bound* to the content —
+            # recompute the full identity and require equality (a length-only
+            # check would let forged keys with correct lengths be persisted).
+            computed, _, _, _ = self.identity.key_bytes(raw)
+            if computed != blob_key:
+                raise CorruptContent("blob_key does not match content (identity mismatch)")
         # Decision J: the key is the identity; a broken identity implementation
         # must fail before any SQL is written.
         parsed_len, _, _ = self.identity.parse(blob_key)
@@ -135,8 +143,15 @@ class BlobStore:
             "SELECT * FROM encodings WHERE blob_key=? AND profile=?", (blob_key, profile)
         )
         if row is not None:
-            if s.payload(blob_key, profile, row["shard_id"]) is not None:
+            if s.payload_exists(blob_key, profile, row["shard_id"]):
                 # Healthy dedupe hit (decision E): report the stored row as-is.
+                # "put succeeded" must imply "content is readable": a required
+                # dictionary that vanished is a typed error, not a silent hit
+                # (review §4.2, P1-5).
+                if row["zstd_dict_id"] is not None and s.dict_bytes(str(row["zstd_dict_id"])) is None:
+                    raise MissingContent(
+                        f"dictionary {row['zstd_dict_id']!r} missing for {(blob_key, profile)}"
+                    )
                 return PreparedPut(blob_key, raw_len, profile, enc=None, shard_id=row["shard_id"])
             # Repair: payload vanished but the encoding row survives. Re-encode
             # with the *stored* policy (never the current profile) so a put
@@ -151,10 +166,10 @@ class BlobStore:
                 params=cast("dict[str, Any]", stored_params) if isinstance(stored_params, dict) else {},
                 zstd_dict_id=row["zstd_dict_id"],
             )
-            enc = self.codec.encode(raw, stored_profile, self._load_dict(stored_profile))
+            enc = self.codec.encode(raw, stored_profile, self._load_dict(stored_profile, s))
             return PreparedPut(blob_key, raw_len, profile, enc=enc, shard_id=row["shard_id"])
         prof = self._profile_from(profiles, profile)
-        enc = self.codec.encode(raw, prof, self._load_dict(prof))
+        enc = self.codec.encode(raw, prof, self._load_dict(prof, s))
         shard_id = None
         if self.backend.mode == "sqlite_sharded":
             shard_id = self.backend.choose_shard_for_write(enc.stored_len)
@@ -224,24 +239,33 @@ class BlobStore:
             zstd_dict_id=prepared.enc.zstd_dict_id,
         )
 
-    def stream_hash(
+    def hash_stream_events(
         self,
         fp: BinaryIO,
         cancel: CancelToken | None = None,
-        on_bytes: Callable[[int], None] | None = None,
-    ) -> tuple[str, bytes]:
-        """Single-pass spool + hash; returns ``(blob_key, raw)``."""
+    ) -> Generator[OpEvent, None, tuple[str, bytes]]:
+        """Single-pass spool + hash, yielding live progress events (review
+        P2-3): the caller sees ``bytes_in`` grow *while* the source stream is
+        being consumed, not replayed after hashing completes.
+
+        Returns ``(blob_key, raw)`` via the generator's return value.
+        """
+        hasher = self.identity.hasher()
         with tempfile.SpooledTemporaryFile(max_size=_SPOOL_MAX_SIZE) as spool:
-
-            def chunks() -> Iterator[bytes]:
-                while True:
-                    chunk = fp.read(CHUNK_SIZE)
-                    if not chunk:
-                        return
-                    spool.write(chunk)
-                    yield chunk
-
-            blob_key, _, _, _ = self.identity.key_from_chunks(chunks(), cancel, on_bytes=on_bytes)
+            total = 0
+            last_mark = 0
+            while True:
+                check_cancel(cancel)
+                chunk = fp.read(CHUNK_SIZE)
+                if not chunk:
+                    break
+                spool.write(chunk)
+                hasher.update(chunk)
+                total += len(chunk)
+                if total - last_mark >= PROGRESS_INTERVAL:
+                    yield OpEvent(kind="progress", op="put", metrics={"bytes_in": total})
+                    last_mark = total
+            blob_key, _, _, _ = hasher.digest()
             spool.seek(0)
             raw = spool.read()
         return blob_key, raw
@@ -276,15 +300,7 @@ class BlobStore:
         def _run() -> Generator[OpEvent, None, PutResult]:
             check_cancel(cancel)
             yield OpEvent(kind="start", op="put", phase="stream_hash")
-            marks: list[int] = []
-
-            def on_bytes(total: int) -> None:
-                if total - (marks[-1] if marks else 0) >= PROGRESS_INTERVAL:
-                    marks.append(total)
-
-            blob_key, raw = self.stream_hash(fp, cancel, on_bytes=on_bytes)
-            for mark in marks:
-                yield OpEvent(kind="progress", op="put", metrics={"bytes_in": mark})
+            blob_key, raw = yield from self.hash_stream_events(fp, cancel)
             with self.backend.session() as s:
                 prepared = self.prepare_bytes(raw, profile, blob_key=blob_key, session=s)
                 result = self._persist(s, prepared)
@@ -315,12 +331,20 @@ class BlobStore:
             dict_bytes = s.dict_bytes(str(row["zstd_dict_id"]))
             if dict_bytes is None:
                 raise MissingContent(f"dictionary {row['zstd_dict_id']!r} missing for {ref}")
+        # The blob_key declares the canonical length: use it to bound zstd
+        # decompression output so a corrupt payload cannot balloon memory
+        # (review P2-6). An unparsable key is corruption, not a raw ValueError.
+        try:
+            expected_len = self.identity.parse(blob_key)[0]
+        except ValueError as exc:
+            raise CorruptContent(f"invalid blob_key {blob_key!r}") from exc
         try:
             return self.codec.decode(
                 payload,
                 codec=str(row["codec"]),
                 codec_params_json=str(row["codec_params_json"]),
                 dict_bytes=dict_bytes,
+                max_output_size=expected_len,
             )
         except (MissingContent, CorruptContent):
             raise
@@ -445,9 +469,22 @@ class BlobStore:
                     if row is None:
                         skipped += 1
                         continue
-                    raw = self._decode_row(s, row)
-                    prof = policy or self._profile_from(profiles, ref.profile)
-                    enc = self.codec.encode(raw, prof, self._load_dict(prof))
+                    try:
+                        raw = self._decode_row(s, row)
+                        prof = policy or self._profile_from(profiles, ref.profile)
+                        enc = self.codec.encode(raw, prof, self._load_dict(prof, s))
+                    except (MissingContent, CorruptContent, UnknownProfile) as exc:
+                        # Per-target data problems (missing payload/dict, corrupt
+                        # payload, deleted profile) must not kill a bulk run
+                        # (review P1-3): skip and keep going.
+                        skipped += 1
+                        yield OpEvent(
+                            kind="log",
+                            op="reencode",
+                            message=f"skipped {ref}: {exc}",
+                            metrics={"targets": targets_seen, "skipped": skipped},
+                        )
+                        continue
                     self.check_blob_limit(enc.stored_len, s.conn)
                     # In-place update of payload + encodings in one transaction (spec 7.5).
                     now = self.backend.now()
@@ -606,7 +643,13 @@ class BlobStore:
         options: dict[str, Any] | None = None,
         cancel: CancelToken | None = None,
     ) -> Operation[CompactResult]:
-        """VACUUM the index and (in sharded mode) selected/all shards (spec 10.3, decision H)."""
+        """VACUUM the index and (in sharded mode) selected/all shards (spec 10.3, decision H).
+
+        ``options["shard_ids"]`` is only meaningful in sharded mode: passing it
+        to ``sqlite_single`` raises ``ValueError``, and an empty list vacuums
+        the index only (review P1-4). Unknown shard ids are rejected — compact
+        never creates a shard file (review P0-2).
+        """
 
         def _run() -> Generator[OpEvent, None, CompactResult]:
             check_cancel(cancel)
@@ -614,14 +657,22 @@ class BlobStore:
             unknown = set(opts) - _COMPACT_OPTION_KEYS
             if unknown:
                 raise ValueError(f"unknown compact options: {sorted(unknown)}")
+            if "shard_ids" in opts and self.backend.mode != "sqlite_sharded":
+                raise ValueError("compact option 'shard_ids' is only valid for sqlite_sharded")
             targets: list[str] = []
             yield OpEvent(kind="start", op="compact")
             targets.append(self.backend.vacuum_index())
             if self.backend.mode == "sqlite_sharded":
-                shard_ids = opts.get("shard_ids") or self.backend.list_shards()
-                for shard_id in shard_ids:
+                existing = set(self.backend.list_shards())
+                requested = (
+                    [int(sid) for sid in opts["shard_ids"]] if "shard_ids" in opts else sorted(existing)
+                )
+                unknown_shards = [sid for sid in requested if sid not in existing]
+                if unknown_shards:
+                    raise ValueError(f"unknown shard ids: {unknown_shards}")
+                for shard_id in requested:
                     check_cancel(cancel)
-                    targets.append(self.backend.vacuum_shard(int(shard_id)))
+                    targets.append(self.backend.vacuum_shard(shard_id))
             result = CompactResult(mode="vacuum", targets=targets)
             yield OpEvent(kind="done", op="compact", metrics={"targets": len(targets)})
             return result

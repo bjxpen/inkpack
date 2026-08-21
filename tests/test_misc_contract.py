@@ -175,9 +175,11 @@ def test_missing_dict_is_missingcontent_not_corrupt(repo):
         repo.store.get_bytes(put.ref)
     with pytest.raises(MissingContent):
         repo.store.open(put.ref)
+    # "put succeeded" must imply "content is readable": a dedupe hit with a
+    # missing required dict is a typed error, and an upsert re-putting the same
+    # body fails the same way (review §4.2, P1-5).
     novel = repo.create_novel("N")
-    chapter = repo.upsert_chapter(novel, "1", b"class-lock " * 200, "zstd_dict")
     with pytest.raises(MissingContent):
-        repo.get_chapter_bytes(chapter)
+        repo.upsert_chapter(novel, "1", b"class-lock " * 200, "zstd_dict")
     verify = repo.store.verify().result
     assert verify.missing == 1 and verify.corrupt == 0

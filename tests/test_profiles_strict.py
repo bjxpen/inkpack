@@ -77,7 +77,11 @@ def test_profiles_from_config_strict_unit():
         profiles_from_config({"raw": {"codec": "zstd", "params": [], "zstd_dict_id": None}})
     with pytest.raises(InkpackError):
         profiles_from_config({"raw": {"codec": "zstd", "params": {}, "zstd_dict_id": 5}})
-    assert profiles_from_config(None) == {}
+    # Top-level strictness (review P1-2): non-dict values are corruption.
+    with pytest.raises(InkpackError):
+        profiles_from_config(None)
+    with pytest.raises(InkpackError):
+        profiles_from_config(["not", "a", "dict"])
     assert profiles_from_config({}) == {}
     parsed = profiles_from_config({"raw": {"codec": "none", "params": {"a": 1}, "zstd_dict_id": None}})
     assert parsed["raw"].params["a"] == 1

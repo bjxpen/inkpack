@@ -67,11 +67,43 @@ class Identity(Protocol):
         """Extract ``(raw_len, sha256_hex, blake2b128_hex)``; raise on bad format."""
         ...
 
+    def hasher(self) -> IdentityHasher:
+        """Return an incremental hasher for single-pass hashing of a stream
+        while the caller controls the loop (live progress, review P2-3)."""
+        ...
+
+
+class IdentityHasher(Protocol):
+    def update(self, chunk: bytes) -> None: ...
+
+    def digest(self) -> tuple[str, int, str, str]:
+        """Finalize: ``(blob_key, raw_len, sha256_hex, blake2b128_hex)``."""
+        ...
+
+
+class _IKB1Hasher:
+    def __init__(self) -> None:
+        self._sha = hashlib.sha256()
+        self._blake = hashlib.blake2b(digest_size=16)
+        self._raw_len = 0
+
+    def update(self, chunk: bytes) -> None:
+        self._raw_len += len(chunk)
+        self._sha.update(chunk)
+        self._blake.update(chunk)
+
+    def digest(self) -> tuple[str, int, str, str]:
+        sha_hex, blake_hex = self._sha.hexdigest(), self._blake.hexdigest()
+        return f"ikb1:{self._raw_len}:{sha_hex}:{blake_hex}", self._raw_len, sha_hex, blake_hex
+
 
 class IKB1Identity:
     """Default ``ikb1`` policy: ``ikb1:<raw_len>:<sha256>:<blake2b-128>``."""
 
     name = "ikb1"
+
+    def hasher(self) -> IdentityHasher:
+        return _IKB1Hasher()
 
     def key_from_chunks(
         self,
@@ -226,12 +258,29 @@ class CodecEngine:
         codec: str,
         codec_params_json: str,
         dict_bytes: bytes | None,
+        max_output_size: int | None = None,
     ) -> bytes:
         del codec_params_json  # kept in the contract; zstd decoding needs no params
         if codec == "none":
             return encoded
         if codec != "zstd":
             raise ValueError(f"unsupported codec: {codec!r}")
+        if max_output_size is not None:
+            # Bound decompressed output using the canonical raw_len from the
+            # blob_key (review P2-6). One-shot decompress grows its output
+            # buffer regardless of max_output_size, so the real guard is the
+            # frame header's declared content size, checked BEFORE any
+            # allocation happens. Frames without a declared size are only
+            # produced by external tooling; our compressor always writes one.
+            try:
+                declared = _zstd.frame_content_size(encoded)
+            except Exception as exc:
+                raise CorruptContent(f"zstd decode failed: {exc}") from exc
+            if declared and declared > max_output_size:
+                raise CorruptContent(
+                    f"zstd frame declares {declared} bytes, exceeding the bound of "
+                    f"{max_output_size} declared by the blob_key"
+                )
         try:
             dict_data = _zstd.ZstdCompressionDict(dict_bytes) if dict_bytes is not None else None
             return _zstd.ZstdDecompressor(dict_data=dict_data).decompress(encoded)

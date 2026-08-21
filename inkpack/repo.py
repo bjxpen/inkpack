@@ -6,14 +6,12 @@ import io
 from collections.abc import Generator, Iterator
 from typing import Any, BinaryIO, cast
 
-from . import blobstore as _blobstore
 from .blobstore import BlobStore, PreparedPut
 from .sqlite import SqliteBackend
 from .types import (
     CancelToken,
     ChapterInfo,
     ContentRef,
-    MissingContent,
     NotFound,
     Operation,
     OpEvent,
@@ -117,6 +115,13 @@ class Repository:
         if not self.backend.delete_chapter(int(chapter_id)):
             raise NotFound(f"chapter {chapter_id} not found")
 
+    def _require_novel(self, novel_id: int) -> None:
+        """Fail fast on a missing novel BEFORE hashing/encoding/shard
+        allocation, so a failed upsert has no side effects (review P1-1). The
+        write transaction re-probes for race safety."""
+        if self.backend.get_novel(int(novel_id)) is None:
+            raise NotFound(f"novel {novel_id} not found")
+
     def upsert_chapter(
         self,
         novel_id: int,
@@ -128,8 +133,10 @@ class Repository:
     ) -> int:
         """Insert or replace a chapter; content + catalog commit atomically.
 
-        A failure (e.g. missing novel, busy) leaves no orphan blob behind.
+        A failure (e.g. missing novel, busy) leaves no orphan blob or empty
+        shard behind.
         """
+        self._require_novel(novel_id)
         hints = hints or {}
         prepared = self.store.prepare_bytes(body_bytes, profile)
         if prepared.enc is not None:
@@ -159,23 +166,16 @@ class Repository:
         size_hint: int | None = None,
         cancel: CancelToken | None = None,
     ) -> Operation[int]:
-        """Streaming upsert: hashes the stream (progress events) then commits
-        content + catalog atomically. Returns an Operation[int] (chapter id)."""
+        """Streaming upsert: hashes the stream (live progress events) then
+        commits content + catalog atomically. Returns an Operation[int]."""
         del size_hint
         hints = hints or {}
 
         def _run() -> Generator[OpEvent, None, int]:
             check_cancel(cancel)
+            self._require_novel(novel_id)
             yield OpEvent(kind="start", op="put", phase="stream_hash")
-            marks: list[int] = []
-
-            def on_bytes(total: int) -> None:
-                if total - (marks[-1] if marks else 0) >= _blobstore.PROGRESS_INTERVAL:
-                    marks.append(total)
-
-            blob_key, raw = self.store.stream_hash(fp, cancel, on_bytes=on_bytes)
-            for mark in marks:
-                yield OpEvent(kind="progress", op="put", metrics={"bytes_in": mark})
+            blob_key, raw = yield from self.store.hash_stream_events(fp, cancel)
             prepared: PreparedPut = self.store.prepare_bytes(raw, profile, blob_key=blob_key)
             if prepared.enc is not None:
                 self.store.check_blob_limit(prepared.enc.stored_len)
@@ -204,7 +204,9 @@ class Repository:
     def _chapter_ref(self, chapter_id: int) -> ContentRef:
         row = self.backend.get_chapter(chapter_id)
         if row is None:
-            raise MissingContent(f"chapter {chapter_id} not found")
+            # A missing catalog row is a catalog miss (review P1-6): NotFound,
+            # not MissingContent (which is reserved for missing stored content).
+            raise NotFound(f"chapter {chapter_id} not found")
         return ContentRef(blob_key=str(row["blob_key"]), profile=str(row["profile"]))
 
     def get_chapter_bytes(self, chapter_id: int) -> bytes:
