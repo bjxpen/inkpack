@@ -6,7 +6,7 @@ import pytest
 
 from inkpack import ContentRef, MissingContent, Profile
 
-from .conftest import assert_repo_consistent, enc_row, payload_bytes, set_payload
+from .conftest import assert_repo_consistent, delete_payload_row, enc_row, payload_bytes, set_payload
 
 # -- reencode ----------------------------------------------------------------
 
@@ -116,8 +116,7 @@ def test_verify_limit(repo):
 
 def test_verify_detects_missing_payload(repo):
     put = repo.store.put_bytes(b"verify-missing", profile="raw").result
-    row = enc_row(repo, put.ref)
-    repo.backend.clear_payload(put.ref.blob_key, put.ref.profile, row["shard_id"])
+    delete_payload_row(repo, put.ref)
     verify = repo.store.verify().result
     assert verify.missing == 1
     assert verify.ok == 0 and verify.corrupt == 0
@@ -143,8 +142,7 @@ def test_verify_mixed_counts(repo):
     good = repo.store.put_bytes(b"good", profile="raw").result
     missing = repo.store.put_bytes(b"gone", profile="raw").result
     corrupt = repo.store.put_bytes(b"bad", profile="raw").result
-    row = enc_row(repo, missing.ref)
-    repo.backend.clear_payload(missing.ref.blob_key, missing.ref.profile, row["shard_id"])
+    delete_payload_row(repo, missing.ref)
     set_payload(repo, corrupt.ref, b"different")
     verify = repo.store.verify().result
     assert verify.checked == 3

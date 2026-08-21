@@ -102,6 +102,27 @@ def set_payload(repo, ref: ContentRef, data: bytes) -> None:
             )
 
 
+def delete_payload_row(repo, ref: ContentRef) -> None:
+    """Delete a payload row directly on the DB file (test corruption helper).
+
+    Uses a separate ``sqlite3.connect`` on the file path (review §26), never
+    the backend's session connection.
+    """
+    row = enc_row(repo, ref)
+    assert row is not None, "no encoding row to delete payload for"
+    if repo.backend.mode == "sqlite_single":
+        conn = sqlite3.connect(str(repo.backend.index_path))
+    else:
+        conn = sqlite3.connect(str(repo.backend.shard_path(int(row["shard_id"]))))
+    try:
+        conn.execute(
+            "DELETE FROM payload WHERE blob_key=? AND profile=?", (ref.blob_key, ref.profile)
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def delete_dict(repo, dict_id: str) -> None:
     with repo.backend.txn(write=True) as conn:
         conn.execute("DELETE FROM dicts WHERE dict_id=?", (dict_id,))

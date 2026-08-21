@@ -4,17 +4,24 @@ Depends only on an injected :class:`SqliteBackend`, a :class:`CodecEngine` and
 an :class:`Identity` policy. All long operations return an :class:`Operation`
 that yields :class:`OpEvent` objects; the generator's ``return`` value becomes
 ``Operation.result``.
+
+Connection policy: one operation-scoped session (review §13 phase 1) per
+public call, so reads never pay one connection per statement and GC can hold
+TEMP tables.
 """
 
 from __future__ import annotations
 
 import io
+import json
+import sqlite3
 import tempfile
-from collections.abc import Generator, Iterable, Iterator
+from collections.abc import Callable, Generator, Iterable, Iterator
+from dataclasses import dataclass
 from typing import Any, BinaryIO, cast
 
-from .codec import IKB1, CodecEngine, Encoded, Identity, dict_id_for_bytes
-from .sqlite import SqliteBackend
+from .codec import CHUNK_SIZE, IKB1, CodecEngine, Encoded, Identity, dict_id_for_bytes
+from .sqlite import Session, SqliteBackend
 from .types import (
     CancelToken,
     CompactResult,
@@ -28,16 +35,35 @@ from .types import (
     PutResult,
     ReencodeResult,
     TrainDictResult,
+    UnknownProfile,
     VerifyResult,
     check_cancel,
     profiles_from_config,
+    validate_profile_entry,
 )
 
-_READ_CHUNK = 128 * 1024
 _SPOOL_MAX_SIZE = 2 * 1024 * 1024
+PROGRESS_INTERVAL = 8 * 1024 * 1024
+_PAGE_SIZE = 500
 
 _REENCODE_OPTION_KEYS = frozenset({"profile", "codec", "params", "zstd_dict_id"})
 _COMPACT_OPTION_KEYS = frozenset({"shard_ids"})
+
+
+@dataclass(frozen=True)
+class PreparedPut:
+    """Outcome of hashing + dedupe-checking one payload, before persisting.
+
+    ``enc is None`` signals a healthy dedupe hit: nothing may be rewritten
+    (decision E). Otherwise ``enc`` holds the bytes to persist (either a new
+    encoding or a repair of a missing payload under the *stored* policy).
+    """
+
+    blob_key: str
+    raw_len: int
+    profile: str
+    enc: Encoded | None
+    shard_id: int | None
 
 
 class BlobStore:
@@ -53,14 +79,20 @@ class BlobStore:
 
     # -- helpers ------------------------------------------------------------
 
-    def _profile(self, name: str) -> Profile:
-        profiles = profiles_from_config(self.backend.config_get("profiles"))
-        if name not in profiles:
-            raise KeyError(f"profile not found: {name}")
-        return profiles[name]
+    @staticmethod
+    def _profile_from(snapshot: dict[str, Profile], name: str) -> Profile:
+        try:
+            return snapshot[name]
+        except KeyError:
+            raise UnknownProfile(f"profile not found: {name}") from None
 
     def _load_dict(self, profile: Profile) -> bytes | None:
-        if profile.zstd_dict_id is None:
+        """Load the profile's dictionary; codec-aware (review §4).
+
+        A dict is only relevant for ``zstd``, so ``none`` never probes the
+        dict table even if a stale id is set.
+        """
+        if profile.codec != "zstd" or profile.zstd_dict_id is None:
             return None
         dict_bytes = self.backend.get_dict(profile.zstd_dict_id)
         if dict_bytes is None:
@@ -69,57 +101,150 @@ class BlobStore:
             )
         return dict_bytes
 
-    def _encode(self, raw: bytes, profile: Profile) -> Encoded:
-        """Encode with the profile's policy, resolving its dictionary."""
-        return self.codec.encode(raw, profile, self._load_dict(profile))
+    def check_blob_limit(self, stored_len: int, conn: sqlite3.Connection | None = None) -> None:
+        """Refuse payloads that cannot fit in one SQLite BLOB (review §14).
 
-    def _store(self, *, blob_key: str, raw: bytes, profile: str, cancel: CancelToken | None) -> PutResult:
-        """Dedupe check + encode + persist for an already-hashed payload."""
-        check_cancel(cancel)
-        existing = self.backend.get_encoding(blob_key, profile)
-        if existing is not None:
-            # Dedupe hit (decision E): report the stored encoding as-is.
-            return PutResult(
-                ref=ContentRef(blob_key=blob_key, profile=profile),
-                raw_len=len(raw),
-                stored_len=int(existing["stored_len"]),
-                codec=str(existing["codec"]),
-                zstd_dict_id=existing["zstd_dict_id"],
+        ``conn`` is an open session connection used to probe the limit without
+        an extra connection.
+        """
+        limit = self.backend.blob_length_limit(conn=conn)
+        if stored_len > limit:
+            raise ValueError(
+                f"encoded payload of {stored_len} bytes exceeds the SQLite blob length limit "
+                f"({limit} bytes); split the chapter into smaller parts"
             )
-        prof = self._profile(profile)
-        enc = self._encode(raw, prof)
+
+    # -- prepare / persist ---------------------------------------------------
+
+    def _prepare(self, s: Session, raw: bytes, profile: str, blob_key: str | None) -> PreparedPut:
+        # Profile map snapshot, read on the operation's connection (review §18).
+        profiles = profiles_from_config(s.config("profiles"))
+        if blob_key is None:
+            blob_key, raw_len, _, _ = self.identity.key_bytes(raw)
+        else:
+            raw_len = len(raw)
+        # Decision J: the key is the identity; a broken identity implementation
+        # must fail before any SQL is written.
+        parsed_len, _, _ = self.identity.parse(blob_key)
+        if parsed_len != len(raw):
+            raise CorruptContent(
+                f"identity length mismatch: blob_key declares {parsed_len} bytes "
+                f"but {len(raw)} were supplied"
+            )
+        row = s.query_one(
+            "SELECT * FROM encodings WHERE blob_key=? AND profile=?", (blob_key, profile)
+        )
+        if row is not None:
+            if s.payload(blob_key, profile, row["shard_id"]) is not None:
+                # Healthy dedupe hit (decision E): report the stored row as-is.
+                return PreparedPut(blob_key, raw_len, profile, enc=None, shard_id=row["shard_id"])
+            # Repair: payload vanished but the encoding row survives. Re-encode
+            # with the *stored* policy (never the current profile) so a put
+            # does not silently migrate encoding policy.
+            try:
+                stored_params = json.loads(str(row["codec_params_json"]))
+            except json.JSONDecodeError as exc:
+                raise CorruptContent(f"stored codec_params_json is invalid for {(blob_key, profile)}") from exc
+            stored_profile = Profile(
+                name=profile,
+                codec=str(row["codec"]),
+                params=cast("dict[str, Any]", stored_params) if isinstance(stored_params, dict) else {},
+                zstd_dict_id=row["zstd_dict_id"],
+            )
+            enc = self.codec.encode(raw, stored_profile, self._load_dict(stored_profile))
+            return PreparedPut(blob_key, raw_len, profile, enc=enc, shard_id=row["shard_id"])
+        prof = self._profile_from(profiles, profile)
+        enc = self.codec.encode(raw, prof, self._load_dict(prof))
         shard_id = None
         if self.backend.mode == "sqlite_sharded":
             shard_id = self.backend.choose_shard_for_write(enc.stored_len)
+        return PreparedPut(blob_key, raw_len, profile, enc=enc, shard_id=shard_id)
+
+    def prepare_bytes(
+        self,
+        raw: bytes,
+        profile: str,
+        *,
+        blob_key: str | None = None,
+        session: Session | None = None,
+    ) -> PreparedPut:
+        """Hash + dedupe-check + encode without writing (used by put paths and
+        the Repository's atomic chapter upsert)."""
+        if session is not None:
+            return self._prepare(session, raw, profile, blob_key)
+        with self.backend.session() as s:
+            return self._prepare(s, raw, profile, blob_key)
+
+    def _persist(self, s: Session, prepared: PreparedPut) -> PutResult:
+        """Persist a prepared put on the session's connection (one write txn)."""
+        if prepared.enc is None:
+            row = s.query_one(
+                "SELECT codec, stored_len, zstd_dict_id FROM encodings "
+                "WHERE blob_key=? AND profile=?",
+                (prepared.blob_key, prepared.profile),
+            )
+            if row is None:
+                raise MissingContent(
+                    f"encoding for {(prepared.blob_key, prepared.profile)} vanished between prepare and persist"
+                )
+            return PutResult(
+                ref=ContentRef(prepared.blob_key, prepared.profile),
+                raw_len=prepared.raw_len,
+                stored_len=int(row["stored_len"]),
+                codec=str(row["codec"]),
+                zstd_dict_id=row["zstd_dict_id"],
+            )
+        self.check_blob_limit(prepared.enc.stored_len, s.conn)
         now = self.backend.now()
-        self.backend.store_encoding_and_payload(
-            blob_key=blob_key,
-            raw_len=len(raw),
-            created_at=now,
-            profile=profile,
-            codec=enc.codec,
-            codec_params_json=enc.codec_params_json,
-            zstd_dict_id=enc.zstd_dict_id,
-            stored_len=enc.stored_len,
-            checksum=None,
-            shard_id=shard_id,
-            updated_at=now,
-            payload=enc.data,
-        )
+        with self.backend.txn_on(
+            s.conn,
+            write=True,
+            attach_shard_id=prepared.shard_id if self.backend.mode == "sqlite_sharded" else None,
+        ) as conn:
+            self.backend.store_encoding_and_payload_on(
+                conn,
+                blob_key=prepared.blob_key,
+                raw_len=prepared.raw_len,
+                created_at=now,
+                profile=prepared.profile,
+                codec=prepared.enc.codec,
+                codec_params_json=prepared.enc.codec_params_json,
+                zstd_dict_id=prepared.enc.zstd_dict_id,
+                stored_len=prepared.enc.stored_len,
+                checksum=None,
+                shard_id=prepared.shard_id,
+                updated_at=now,
+                payload=prepared.enc.data,
+            )
         return PutResult(
-            ref=ContentRef(blob_key=blob_key, profile=profile),
-            raw_len=len(raw),
-            stored_len=enc.stored_len,
-            codec=enc.codec,
-            zstd_dict_id=enc.zstd_dict_id,
+            ref=ContentRef(prepared.blob_key, prepared.profile),
+            raw_len=prepared.raw_len,
+            stored_len=prepared.enc.stored_len,
+            codec=prepared.enc.codec,
+            zstd_dict_id=prepared.enc.zstd_dict_id,
         )
 
-    def _emit_put_done(self, result: PutResult) -> OpEvent:
-        return OpEvent(
-            kind="done",
-            op="put",
-            metrics={"bytes_in": result.raw_len, "bytes_out": result.stored_len},
-        )
+    def stream_hash(
+        self,
+        fp: BinaryIO,
+        cancel: CancelToken | None = None,
+        on_bytes: Callable[[int], None] | None = None,
+    ) -> tuple[str, bytes]:
+        """Single-pass spool + hash; returns ``(blob_key, raw)``."""
+        with tempfile.SpooledTemporaryFile(max_size=_SPOOL_MAX_SIZE) as spool:
+
+            def chunks() -> Iterator[bytes]:
+                while True:
+                    chunk = fp.read(CHUNK_SIZE)
+                    if not chunk:
+                        return
+                    spool.write(chunk)
+                    yield chunk
+
+            blob_key, _, _, _ = self.identity.key_from_chunks(chunks(), cancel, on_bytes=on_bytes)
+            spool.seek(0)
+            raw = spool.read()
+        return blob_key, raw
 
     # -- core API (spec 4.3) --------------------------------------------------
 
@@ -127,9 +252,14 @@ class BlobStore:
         def _run() -> Generator[OpEvent, None, PutResult]:
             check_cancel(cancel)
             yield OpEvent(kind="start", op="put", phase="hash")
-            blob_key, _, _, _ = self.identity.key_bytes(data)
-            result = self._store(blob_key=blob_key, raw=data, profile=profile, cancel=cancel)
-            yield self._emit_put_done(result)
+            with self.backend.session() as s:
+                prepared = self.prepare_bytes(data, profile, session=s)
+                result = self._persist(s, prepared)
+            yield OpEvent(
+                kind="done",
+                op="put",
+                metrics={"bytes_in": result.raw_len, "bytes_out": result.stored_len},
+            )
             return result
 
         return Operation(_run)
@@ -146,42 +276,47 @@ class BlobStore:
         def _run() -> Generator[OpEvent, None, PutResult]:
             check_cancel(cancel)
             yield OpEvent(kind="start", op="put", phase="stream_hash")
-            # Single pass over the source stream: spool to disk while hashing,
-            # so non-seekable sources and multi-GB chapters both work.
-            with tempfile.SpooledTemporaryFile(max_size=_SPOOL_MAX_SIZE) as spool:
+            marks: list[int] = []
 
-                def spool_and_yield() -> Iterator[bytes]:
-                    while True:
-                        chunk = fp.read(_READ_CHUNK)
-                        if not chunk:
-                            return
-                        spool.write(chunk)
-                        yield chunk
+            def on_bytes(total: int) -> None:
+                if total - (marks[-1] if marks else 0) >= PROGRESS_INTERVAL:
+                    marks.append(total)
 
-                blob_key, _, _, _ = self.identity.key_from_chunks(spool_and_yield(), cancel)
-                spool.seek(0)
-                raw = spool.read()
-            result = self._store(blob_key=blob_key, raw=raw, profile=profile, cancel=cancel)
-            yield self._emit_put_done(result)
+            blob_key, raw = self.stream_hash(fp, cancel, on_bytes=on_bytes)
+            for mark in marks:
+                yield OpEvent(kind="progress", op="put", metrics={"bytes_in": mark})
+            with self.backend.session() as s:
+                prepared = self.prepare_bytes(raw, profile, blob_key=blob_key, session=s)
+                result = self._persist(s, prepared)
+            yield OpEvent(
+                kind="done",
+                op="put",
+                metrics={"bytes_in": result.raw_len, "bytes_out": result.stored_len},
+            )
             return result
 
         return Operation(_run)
 
-    def get_bytes(self, ref: ContentRef) -> bytes:
-        """Decode using *stored* encoding metadata only (spec 6.2, 6.4)."""
-        row = self.backend.get_encoding(ref.blob_key, ref.profile)
-        if row is None:
-            raise MissingContent(f"encoding not found for {ref}")
-        payload = self.backend.get_payload(ref.blob_key, ref.profile, row["shard_id"])
+    def _decode_row(self, s: Session, row: sqlite3.Row) -> bytes:
+        """Decode one encodings row using *stored* metadata only (spec 6.2).
+
+        The payload + dict are read on the same session (no extra connections,
+        dict bytes cached per operation, review §13/§16). ``verify()`` uses
+        this directly so classification never depends on ``get_bytes``.
+        """
+        blob_key = str(row["blob_key"])
+        profile = str(row["profile"])
+        ref = ContentRef(blob_key=blob_key, profile=profile)
+        payload = s.payload(blob_key, profile, row["shard_id"])
         if payload is None:
             raise MissingContent(f"payload missing for {ref}")
         dict_bytes = None
         if row["zstd_dict_id"] is not None:
-            dict_bytes = self.backend.get_dict(row["zstd_dict_id"])
+            dict_bytes = s.dict_bytes(str(row["zstd_dict_id"]))
             if dict_bytes is None:
                 raise MissingContent(f"dictionary {row['zstd_dict_id']!r} missing for {ref}")
         try:
-            raw = self.codec.decode(
+            return self.codec.decode(
                 payload,
                 codec=str(row["codec"]),
                 codec_params_json=str(row["codec_params_json"]),
@@ -191,11 +326,22 @@ class BlobStore:
             raise
         except Exception as exc:
             raise CorruptContent(f"failed to decode {ref}: {exc}") from exc
-        if bool(self.backend.config_get("verify_on_read") or False):
-            got_key, _, _, _ = self.identity.key_bytes(raw)
-            if got_key != ref.blob_key:
-                raise CorruptContent(f"identity mismatch on read for {ref}")
-        return raw
+
+    def get_bytes(self, ref: ContentRef) -> bytes:
+        """Decode using *stored* encoding metadata only (spec 6.2, 6.4)."""
+        with self.backend.session() as s:
+            row = s.query_one(
+                "SELECT * FROM encodings WHERE blob_key=? AND profile=?",
+                (ref.blob_key, ref.profile),
+            )
+            if row is None:
+                raise MissingContent(f"encoding not found for {ref}")
+            raw = self._decode_row(s, row)
+            if bool(s.config("verify_on_read") or False):
+                got_key, _, _, _ = self.identity.key_bytes(raw)
+                if got_key != ref.blob_key:
+                    raise CorruptContent(f"identity mismatch on read for {ref}")
+            return raw
 
     def open(self, ref: ContentRef) -> io.BytesIO:
         """Materialized stable read handle (spec 6.3 MUST: ``BytesIO(get_bytes(ref))``)."""
@@ -246,11 +392,13 @@ class BlobStore:
 
         ``options`` may override the target policy:
         - ``{"profile": name}`` re-encodes every target with that profile's policy,
-        - ``{"codec": ..., "params": ..., "zstd_dict_id": ...}`` supplies an ad-hoc policy.
-        The ``(blob_key, profile)`` key itself never changes.
+        - ``{"codec": ..., "params": ..., "zstd_dict_id": ...}`` supplies an ad-hoc policy,
+          validated with the same rules as ``set_profile`` (review §4).
+        The policy (and the profile map) is frozen at operation start, so
+        ``set_profile`` mid-run cannot change remaining targets (review §18).
         """
 
-        def _target_policy() -> Profile | None:
+        def _target_policy(profiles: dict[str, Profile]) -> Profile | None:
             opts = options or {}
             unknown = set(opts) - _REENCODE_OPTION_KEYS
             if unknown:
@@ -259,57 +407,76 @@ class BlobStore:
             if "profile" in opts:
                 if policy_keys:
                     raise ValueError("reencode option 'profile' cannot be combined with codec/params/zstd_dict_id")
-                return self._profile(str(opts["profile"]))
+                return self._profile_from(profiles, str(opts["profile"]))
             if not policy_keys:
                 return None
             codec = str(opts.get("codec", "zstd"))
             params_raw: Any = opts.get("params") or {}
             if not isinstance(params_raw, dict):
                 raise TypeError("reencode option 'params' must be a dict")
-            params = cast("dict[str, Any]", params_raw)
             zstd_dict_id = opts.get("zstd_dict_id")
             if zstd_dict_id is not None and not isinstance(zstd_dict_id, str):
                 raise TypeError("reencode option 'zstd_dict_id' must be a string or None")
-            return Profile(name="<reencode-override>", codec=codec, params=params, zstd_dict_id=zstd_dict_id)
+            profile = Profile(
+                name="<reencode-override>",
+                codec=codec,
+                params=cast("dict[str, Any]", params_raw),
+                zstd_dict_id=zstd_dict_id,
+            )
+            validate_profile_entry("<reencode-override>", profile)
+            return profile
 
         def _run() -> Generator[OpEvent, None, ReencodeResult]:
             check_cancel(cancel)
-            policy = _target_policy()
-            targets_seen = reencoded = skipped = 0
-            bytes_in = bytes_out = 0
             yield OpEvent(kind="start", op="reencode")
-            for ref in targets:
-                check_cancel(cancel)
-                targets_seen += 1
-                row = self.backend.get_encoding(ref.blob_key, ref.profile)
-                if row is None:
-                    skipped += 1
-                    continue
-                raw = self.get_bytes(ref)
-                prof = policy or self._profile(ref.profile)
-                enc = self._encode(raw, prof)
-                # In-place update of payload + encodings in the same transaction (spec 7.5).
-                now = self.backend.now()
-                self.backend.store_encoding_and_payload(
-                    blob_key=ref.blob_key,
-                    raw_len=len(raw),
-                    created_at=now,
-                    profile=ref.profile,
-                    codec=enc.codec,
-                    codec_params_json=enc.codec_params_json,
-                    zstd_dict_id=enc.zstd_dict_id,
-                    stored_len=enc.stored_len,
-                    checksum=None,
-                    shard_id=row["shard_id"],
-                    updated_at=now,
-                    payload=enc.data,
-                )
-                reencoded += 1
-                bytes_in += len(raw)
-                bytes_out += enc.stored_len
-                yield OpEvent(
-                    kind="item", op="reencode", metrics={"targets": targets_seen, "reencoded": reencoded}
-                )
+            with self.backend.session() as s:
+                # Policy + profile map frozen at operation start (review §18).
+                profiles = profiles_from_config(s.config("profiles"))
+                policy = _target_policy(profiles)
+                targets_seen = reencoded = skipped = 0
+                bytes_in = bytes_out = 0
+                for ref in targets:
+                    check_cancel(cancel)
+                    targets_seen += 1
+                    row = s.query_one(
+                        "SELECT * FROM encodings WHERE blob_key=? AND profile=?",
+                        (ref.blob_key, ref.profile),
+                    )
+                    if row is None:
+                        skipped += 1
+                        continue
+                    raw = self._decode_row(s, row)
+                    prof = policy or self._profile_from(profiles, ref.profile)
+                    enc = self.codec.encode(raw, prof, self._load_dict(prof))
+                    self.check_blob_limit(enc.stored_len, s.conn)
+                    # In-place update of payload + encodings in one transaction (spec 7.5).
+                    now = self.backend.now()
+                    with self.backend.txn_on(
+                        s.conn,
+                        write=True,
+                        attach_shard_id=row["shard_id"] if self.backend.mode == "sqlite_sharded" else None,
+                    ) as conn:
+                        self.backend.store_encoding_and_payload_on(
+                            conn,
+                            blob_key=ref.blob_key,
+                            raw_len=len(raw),
+                            created_at=now,
+                            profile=ref.profile,
+                            codec=enc.codec,
+                            codec_params_json=enc.codec_params_json,
+                            zstd_dict_id=enc.zstd_dict_id,
+                            stored_len=enc.stored_len,
+                            checksum=None,
+                            shard_id=row["shard_id"],
+                            updated_at=now,
+                            payload=enc.data,
+                        )
+                    reencoded += 1
+                    bytes_in += len(raw)
+                    bytes_out += enc.stored_len
+                    yield OpEvent(
+                        kind="item", op="reencode", metrics={"targets": targets_seen, "reencoded": reencoded}
+                    )
             result = ReencodeResult(
                 targets=targets_seen,
                 reencoded=reencoded,
@@ -324,43 +491,81 @@ class BlobStore:
 
     # -- maintenance (spec 10) -------------------------------------------------
 
+    def _iter_encodings(self, s: Session, limit: int | None) -> Iterator[sqlite3.Row]:
+        """Keyset-paged iteration over encodings (review §15): no fetchall."""
+        last_key: str | None = None
+        last_profile: str | None = None
+        remaining = limit
+        while True:
+            if last_key is None:
+                rows = s.query_all(
+                    "SELECT * FROM encodings ORDER BY blob_key, profile LIMIT ?", (_PAGE_SIZE,)
+                )
+            else:
+                rows = s.query_all(
+                    "SELECT * FROM encodings WHERE (blob_key, profile) > (?, ?) "
+                    "ORDER BY blob_key, profile LIMIT ?",
+                    (last_key, last_profile, _PAGE_SIZE),
+                )
+            if not rows:
+                return
+            for row in rows:
+                if remaining is not None:
+                    if remaining <= 0:
+                        return
+                    remaining -= 1
+                yield row
+                last_key = str(row["blob_key"])
+                last_profile = str(row["profile"])
+
     def verify(
         self,
         limit: int | None = None,
         cancel: CancelToken | None = None,
     ) -> Operation[VerifyResult]:
-        """Decode every encoding and compare against the ``ikb1`` identity (spec 10.1, decision D)."""
+        """Decode every encoding and compare against the identity (spec 10.1).
+
+        Every row is classified as exactly one of ok / missing / corrupt
+        (decision D): an unparsable ``blob_key`` or undecodable payload counts
+        as corrupt and never aborts the run (review §3). Unexpected errors
+        still propagate.
+        """
 
         def _run() -> Generator[OpEvent, None, VerifyResult]:
             checked = ok = missing = corrupt = 0
             yield OpEvent(kind="start", op="verify")
-            for row in self.backend.iter_encodings(limit=limit):
-                check_cancel(cancel)
-                checked += 1
-                ref = ContentRef(blob_key=str(row["blob_key"]), profile=str(row["profile"]))
-                try:
-                    data = self.get_bytes(ref)
-                except MissingContent:
-                    missing += 1
-                except CorruptContent:
-                    corrupt += 1
-                else:
-                    expected_len, expected_sha, expected_blake = self.identity.parse(ref.blob_key)
-                    got_key, got_len, got_sha, got_blake = self.identity.key_bytes(data)
-                    if (
-                        got_key != ref.blob_key
-                        or got_len != expected_len
-                        or got_sha != expected_sha
-                        or got_blake != expected_blake
-                    ):
+            with self.backend.session() as s:
+                for row in self._iter_encodings(s, limit):
+                    check_cancel(cancel)
+                    checked += 1
+                    try:
+                        raw = self._decode_row(s, row)
+                    except MissingContent:
+                        missing += 1
+                    except CorruptContent:
                         corrupt += 1
                     else:
-                        ok += 1
-                yield OpEvent(
-                    kind="item",
-                    op="verify",
-                    metrics={"checked": checked, "ok": ok, "missing": missing, "corrupt": corrupt},
-                )
+                        try:
+                            expected_len, expected_sha, expected_blake = self.identity.parse(
+                                str(row["blob_key"])
+                            )
+                            got_key, got_len, got_sha, got_blake = self.identity.key_bytes(raw)
+                            if (
+                                got_key != str(row["blob_key"])
+                                or got_len != expected_len
+                                or got_sha != expected_sha
+                                or got_blake != expected_blake
+                            ):
+                                corrupt += 1
+                            else:
+                                ok += 1
+                        except ValueError:
+                            corrupt += 1
+                    yield OpEvent(
+                        kind="item",
+                        op="verify",
+                        metrics={"checked": checked, "ok": ok, "missing": missing, "corrupt": corrupt},
+                    )
             result = VerifyResult(checked=checked, ok=ok, missing=missing, corrupt=corrupt)
             yield OpEvent(kind="done", op="verify", metrics={"checked": checked, "ok": ok})
             return result
@@ -368,14 +573,12 @@ class BlobStore:
         return Operation(_run)
 
     def gc(self, live: Iterable[ContentRef], cancel: CancelToken | None = None) -> Operation[GcResult]:
-        """Delete encodings/payloads not in ``live``, then orphan blobs and dicts (spec 10.2)."""
+        """Delete encodings/payloads not in ``live``, then orphan blobs and dicts."""
 
         def _run() -> Generator[OpEvent, None, GcResult]:
             check_cancel(cancel)
             yield OpEvent(kind="start", op="gc")
-            dead = self.backend.list_dead_encodings(live)
-            check_cancel(cancel)
-            encodings_deleted, payload_rows_deleted = self.backend.delete_encoding_and_payload_group(dead)
+            encodings_deleted, payload_rows_deleted = self.backend.gc(live, cancel)
             blobs_deleted = self.backend.delete_orphan_blobs()
             dicts_deleted = self.backend.delete_unreferenced_dicts()
             result = GcResult(

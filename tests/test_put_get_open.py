@@ -9,7 +9,7 @@ import pytest
 
 from inkpack import ContentRef, CorruptContent, MissingContent, Profile, open_repo
 
-from .conftest import CANONICAL_SAMPLES, NonseekableBytesIO, make_repo, set_payload
+from .conftest import CANONICAL_SAMPLES, NonseekableBytesIO, delete_payload_row, make_repo, set_payload
 
 
 @pytest.mark.parametrize("profile", ["raw", "zstd_nodict"])
@@ -69,12 +69,7 @@ def test_get_missing_encoding_raises(repo):
 
 def test_get_missing_payload_raises(repo):
     put = repo.store.put_bytes(b"gone-payload", profile="raw").result
-    with repo.backend.txn(write=False) as conn:
-        row = conn.execute(
-            "SELECT shard_id FROM encodings WHERE blob_key=? AND profile=?",
-            (put.ref.blob_key, put.ref.profile),
-        ).fetchone()
-    repo.backend.clear_payload(put.ref.blob_key, put.ref.profile, row["shard_id"])
+    delete_payload_row(repo, put.ref)
     with pytest.raises(MissingContent):
         repo.store.get_bytes(put.ref)
 

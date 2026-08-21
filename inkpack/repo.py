@@ -3,15 +3,23 @@
 from __future__ import annotations
 
 import io
-from collections.abc import Iterator
-from typing import Any, cast
+from collections.abc import Generator, Iterator
+from typing import Any, BinaryIO, cast
 
-from .blobstore import BlobStore
+from . import blobstore as _blobstore
+from .blobstore import BlobStore, PreparedPut
 from .sqlite import SqliteBackend
 from .types import (
+    CancelToken,
+    ChapterInfo,
     ContentRef,
     MissingContent,
+    NotFound,
+    Operation,
+    OpEvent,
     Profile,
+    UnknownProfile,
+    check_cancel,
     profiles_from_config,
     profiles_to_config,
     validate_profiles,
@@ -30,10 +38,10 @@ class Repository:
         return profiles_from_config(self.backend.config_get("profiles"))
 
     def get_profile(self, name: str) -> Profile:
-        """Return one profile; raises ``KeyError`` when the name is unknown."""
+        """Return one profile; raises :class:`UnknownProfile` when missing."""
         profiles = self.get_profiles()
         if name not in profiles:
-            raise KeyError(f"profile not found: {name}")
+            raise UnknownProfile(f"profile not found: {name}")
         return profiles[name]
 
     def set_profile(self, profile: Profile) -> None:
@@ -67,6 +75,48 @@ class Repository:
     def list_novels(self, search: str = "") -> list[dict[str, Any]]:
         return self.backend.list_novels(search=search)
 
+    def get_novel(self, novel_id: int) -> dict[str, Any]:
+        """Novel catalog row (no chapters); raises :class:`NotFound`."""
+        row = self.backend.get_novel(int(novel_id))
+        if row is None:
+            raise NotFound(f"novel {novel_id} not found")
+        return dict(row)
+
+    def update_novel(self, novel_id: int, title: str | None = None, slug: str | None = None) -> None:
+        """Update the provided novel fields; raises :class:`NotFound`."""
+        if not self.backend.update_novel(int(novel_id), title=title, slug=slug):
+            raise NotFound(f"novel {novel_id} not found")
+
+    def delete_novel(self, novel_id: int, *, cascade: bool = True) -> None:
+        """Delete a novel (and, with cascade, its chapters + metadata).
+
+        Catalog-only: reclaim content with ``gc(iter_live_content())``.
+        """
+        if not self.backend.delete_novel(int(novel_id), cascade=cascade):
+            raise NotFound(f"novel {novel_id} not found")
+
+    def list_chapters(self, novel_id: int) -> list[ChapterInfo]:
+        """Chapter catalog rows for a novel (no bodies); raises :class:`NotFound`
+        for a missing novel, returns ``[]`` for a novel with no chapters."""
+        if self.backend.get_novel(int(novel_id)) is None:
+            raise NotFound(f"novel {novel_id} not found")
+        return [ChapterInfo(**dict(row)) for row in self.backend.list_chapters(int(novel_id))]
+
+    def get_chapter(self, chapter_id: int) -> ChapterInfo:
+        """One chapter's catalog row; raises :class:`NotFound`."""
+        row = self.backend.get_chapter(int(chapter_id))
+        if row is None:
+            raise NotFound(f"chapter {chapter_id} not found")
+        return ChapterInfo(**dict(row))
+
+    def delete_chapter(self, chapter_id: int) -> None:
+        """Delete a chapter row + its metadata; raises :class:`NotFound`.
+
+        Catalog-only: reclaim content with ``gc(iter_live_content())``.
+        """
+        if not self.backend.delete_chapter(int(chapter_id)):
+            raise NotFound(f"chapter {chapter_id} not found")
+
     def upsert_chapter(
         self,
         novel_id: int,
@@ -76,18 +126,80 @@ class Repository:
         hints: dict[str, Any] | None = None,
         meta: dict[str, Any] | None = None,
     ) -> int:
+        """Insert or replace a chapter; content + catalog commit atomically.
+
+        A failure (e.g. missing novel, busy) leaves no orphan blob behind.
+        """
         hints = hints or {}
-        put = self.store.put_bytes(body_bytes, profile=profile)
-        ref = put.result.ref
-        return self.backend.upsert_chapter(
+        prepared = self.store.prepare_bytes(body_bytes, profile)
+        if prepared.enc is not None:
+            self.store.check_blob_limit(prepared.enc.stored_len)
+        return self.backend.upsert_chapter_with_content(
             novel_id=int(novel_id),
             order_key=str(chapter_key),
-            blob_key=ref.blob_key,
-            profile=ref.profile,
+            blob_key=prepared.blob_key,
+            raw_len=prepared.raw_len,
+            created_at=self.backend.now(),
+            profile=prepared.profile,
             media_type=hints.get("media_type"),
             charset=hints.get("charset"),
             meta=meta,
+            enc=prepared.enc,
+            shard_id=prepared.shard_id,
         )
+
+    def upsert_chapter_stream(
+        self,
+        fp: BinaryIO,
+        novel_id: int,
+        chapter_key: str | int,
+        profile: str,
+        hints: dict[str, Any] | None = None,
+        meta: dict[str, Any] | None = None,
+        size_hint: int | None = None,
+        cancel: CancelToken | None = None,
+    ) -> Operation[int]:
+        """Streaming upsert: hashes the stream (progress events) then commits
+        content + catalog atomically. Returns an Operation[int] (chapter id)."""
+        del size_hint
+        hints = hints or {}
+
+        def _run() -> Generator[OpEvent, None, int]:
+            check_cancel(cancel)
+            yield OpEvent(kind="start", op="put", phase="stream_hash")
+            marks: list[int] = []
+
+            def on_bytes(total: int) -> None:
+                if total - (marks[-1] if marks else 0) >= _blobstore.PROGRESS_INTERVAL:
+                    marks.append(total)
+
+            blob_key, raw = self.store.stream_hash(fp, cancel, on_bytes=on_bytes)
+            for mark in marks:
+                yield OpEvent(kind="progress", op="put", metrics={"bytes_in": mark})
+            prepared: PreparedPut = self.store.prepare_bytes(raw, profile, blob_key=blob_key)
+            if prepared.enc is not None:
+                self.store.check_blob_limit(prepared.enc.stored_len)
+            chapter_id = self.backend.upsert_chapter_with_content(
+                novel_id=int(novel_id),
+                order_key=str(chapter_key),
+                blob_key=prepared.blob_key,
+                raw_len=prepared.raw_len,
+                created_at=self.backend.now(),
+                profile=prepared.profile,
+                media_type=hints.get("media_type"),
+                charset=hints.get("charset"),
+                meta=meta,
+                enc=prepared.enc,
+                shard_id=prepared.shard_id,
+            )
+            yield OpEvent(
+                kind="done",
+                op="put",
+                metrics={"bytes_in": len(raw), "bytes_out": prepared.enc.stored_len if prepared.enc else 0},
+            )
+            return chapter_id
+
+        return Operation(_run)
 
     def _chapter_ref(self, chapter_id: int) -> ContentRef:
         row = self.backend.get_chapter(chapter_id)

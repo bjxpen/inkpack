@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
 from typing import Any, BinaryIO, Protocol
 
@@ -44,6 +44,7 @@ class Identity(Protocol):
         fp: BinaryIO,
         size_hint: int | None = None,
         cancel: CancelToken | None = None,
+        on_bytes: Callable[[int], None] | None = None,
     ) -> tuple[str, int, str, str]:
         """Single-pass identity over a binary stream."""
         ...
@@ -52,8 +53,14 @@ class Identity(Protocol):
         self,
         chunks: Iterable[bytes],
         cancel: CancelToken | None = None,
+        on_bytes: Callable[[int], None] | None = None,
     ) -> tuple[str, int, str, str]:
-        """Single-pass identity over an iterable of byte chunks."""
+        """Single-pass identity over an iterable of byte chunks.
+
+        ``on_bytes`` is invoked with the cumulative byte count after each
+        chunk, letting callers surface progress without coupling the identity
+        to the operation protocol.
+        """
         ...
 
     def parse(self, blob_key: str) -> tuple[int, str, str]:
@@ -70,6 +77,7 @@ class IKB1Identity:
         self,
         chunks: Iterable[bytes],
         cancel: CancelToken | None = None,
+        on_bytes: Callable[[int], None] | None = None,
     ) -> tuple[str, int, str, str]:
         sha = hashlib.sha256()
         blake = hashlib.blake2b(digest_size=16)
@@ -77,6 +85,8 @@ class IKB1Identity:
         for chunk in chunks:
             check_cancel(cancel)
             raw_len += len(chunk)
+            if on_bytes is not None:
+                on_bytes(raw_len)
             sha.update(chunk)
             blake.update(chunk)
         sha_hex, blake_hex = sha.hexdigest(), blake.hexdigest()
@@ -90,9 +100,10 @@ class IKB1Identity:
         fp: BinaryIO,
         size_hint: int | None = None,
         cancel: CancelToken | None = None,
+        on_bytes: Callable[[int], None] | None = None,
     ) -> tuple[str, int, str, str]:
         del size_hint  # the stream is hashed exactly; the hint only reserves space
-        return self.key_from_chunks(_iter_reads(fp), cancel)
+        return self.key_from_chunks(_iter_reads(fp), cancel, on_bytes=on_bytes)
 
     def parse(self, blob_key: str) -> tuple[int, str, str]:
         parts = blob_key.split(":")

@@ -822,7 +822,7 @@ Algorithm (spec §6.2, §6.4):
 1. load encoding row; if missing → `MissingContent`
 2. locate payload via shard_id (NULL => single DB)
 3. fetch payload bytes; if missing → `MissingContent`
-4. if `zstd_dict_id` not NULL: load dict bytes from index; if missing dict → `CorruptContent` (cannot decode reliably)
+4. if `zstd_dict_id` not NULL: load dict bytes from index; if missing dict → `MissingContent` (the payload may be intact; a required dependency is absent — Decision C)
 5. decode using `codec.decode(encoded, codec=..., codec_params_json=..., dict_bytes=...)`
    - decode failure => `CorruptContent`
 6. if `verify_on_read` true: recompute ikb1 and compare to blob_key → mismatch => `CorruptContent`

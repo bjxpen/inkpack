@@ -2,13 +2,18 @@
 
 Composition root. Builds the backend, codec engine, identity policy,
 BlobStore and Repository, and re-exports the public API.
+
+Factory contract (review §1): ``create_repo`` refuses an existing repository
+and requires a validated profile set; ``open_repo`` detects the backend
+layout from the filesystem (refusing ambiguous layouts), never creates files,
+and validates the stored ``identity_policy`` / ``backend_mode`` / profiles.
 """
 
 from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
 
 from .blobstore import BlobStore
 from .codec import IKB1, CodecEngine, Identity
@@ -17,6 +22,7 @@ from .sqlite import SqliteBackend
 from .types import (
     Busy,
     Cancelled,
+    ChapterInfo,
     Clock,
     CompactResult,
     ContentRef,
@@ -31,7 +37,9 @@ from .types import (
     PutResult,
     ReencodeResult,
     TrainDictResult,
+    UnknownProfile,
     VerifyResult,
+    profiles_from_config,
     profiles_to_config,
     validate_profiles,
 )
@@ -40,21 +48,6 @@ __version__ = "0.1.0"
 
 DEFAULT_SHARD_CAP_BYTES = 2 << 30
 DEFAULT_SHARD_MIN_BYTES = 256 << 20
-
-
-def _validate_stored_profiles(profiles: Any) -> dict[str, Any]:
-    mapping = cast("dict[str, Any] | None", profiles)
-    if not mapping:
-        raise InkpackError("invalid repo config: profiles missing or empty")
-    out: dict[str, Any] = {}
-    for name, cfg_raw in mapping.items():
-        if not isinstance(cfg_raw, dict):
-            raise InkpackError("invalid repo config: malformed profile entry")
-        cfg = cast("dict[str, Any]", cfg_raw)
-        if cfg.get("codec") not in ("none", "zstd"):
-            raise InkpackError("invalid repo config: malformed profile entry")
-        out[name] = cfg
-    return out
 
 
 def _build_repository(
@@ -83,10 +76,17 @@ def create_repo(
     codec: CodecEngine | None = None,
     clock: Clock | None = None,
 ) -> Repository:
-    """Create a new repository (spec 4.4) and return a ready-to-use Repository."""
+    """Create a new repository (spec 4.4) and return a ready-to-use Repository.
+
+    Refuses to run over an existing repository; ``profiles`` is required
+    (validated via :func:`validate_profiles`).
+    """
     profiles = validate_profiles(profiles)
     identity = identity or IKB1
-    backend = SqliteBackend.open(
+    root = Path(path)
+    if (root / "index.sqlite").exists() or (root / "repo.sqlite").exists():
+        raise InkpackError(f"repository already exists at {root}")
+    backend = SqliteBackend.create(
         path=path,
         mode=backend_mode,
         pragmas=pragmas,
@@ -112,11 +112,25 @@ def open_repo(
     codec: CodecEngine | None = None,
     clock: Clock | None = None,
 ) -> Repository:
-    """Open an existing repository, validating its stored config (decisions I, backend-mode check)."""
+    """Open an existing repository, validating its stored config.
+
+    Layout detection happens here, not in SQL: ``index.sqlite`` + ``payload/``
+    implies ``sqlite_sharded``, ``repo.sqlite`` implies ``sqlite_single``,
+    both raise (ambiguous), neither raises :class:`NotFound`. Stored
+    ``identity_policy``, ``backend_mode`` and profiles are validated
+    (decisions I; review §1, §9).
+    """
     root = Path(path)
-    if not (root / "index.sqlite").exists() and not (root / "repo.sqlite").exists():
-        raise InkpackError(f"no inkpack repository found at {root}")
-    mode = "sqlite_sharded" if (root / "index.sqlite").exists() else "sqlite_single"
+    has_index = (root / "index.sqlite").exists()
+    has_single = (root / "repo.sqlite").exists()
+    if has_index and has_single:
+        raise InkpackError(f"ambiguous repository layout at {root}: both index.sqlite and repo.sqlite present")
+    if has_index:
+        mode = "sqlite_sharded"
+    elif has_single:
+        mode = "sqlite_single"
+    else:
+        raise NotFound(f"no inkpack repository found at {root}")
     backend = SqliteBackend.open(path=path, mode=mode, pragmas=pragmas, clock=clock)
 
     identity_policy = backend.config_get("identity_policy")
@@ -128,7 +142,13 @@ def open_repo(
     elif identity_policy != "ikb1":
         raise InkpackError(f"unsupported identity_policy: {identity_policy!r} (expected 'ikb1')")
 
-    _validate_stored_profiles(backend.config_get("profiles"))
+    stored_profiles = profiles_from_config(backend.config_get("profiles"))
+    if not stored_profiles:
+        raise InkpackError("invalid repo config: profiles missing or empty")
+    try:
+        validate_profiles(stored_profiles)
+    except (TypeError, ValueError) as exc:
+        raise InkpackError(f"invalid repo config: {exc}") from exc
 
     configured_mode = backend.config_get("backend_mode")
     if configured_mode != mode:
@@ -149,6 +169,7 @@ __all__ = [
     "BlobStore",
     "Busy",
     "Cancelled",
+    "ChapterInfo",
     "CompactResult",
     "ContentRef",
     "CorruptContent",
@@ -163,6 +184,7 @@ __all__ = [
     "ReencodeResult",
     "Repository",
     "TrainDictResult",
+    "UnknownProfile",
     "VerifyResult",
     "__version__",
     "create_repo",
