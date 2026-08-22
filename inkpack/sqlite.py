@@ -19,7 +19,7 @@ from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, NoReturn, cast
 
 from .codec import Encoded, canonical_json
 from .types import (
@@ -98,7 +98,7 @@ CREATE INDEX IF NOT EXISTS idx_encodings_zstd_dict_id ON encodings(zstd_dict_id)
 """
 
 _SCHEMA_PAYLOAD_V1 = """
-CREATE TABLE IF NOT EXISTS payload(
+CREATE TABLE IF NOT EXISTS {p}payload(
   blob_key TEXT NOT NULL,
   profile TEXT NOT NULL,
   data BLOB NOT NULL,
@@ -291,23 +291,47 @@ def _require_positive_int(value: Any, label: str) -> int:
 
 
 def _require_scope(scope: Any) -> int | None:
-    """Runtime validation of the ``iter_live_content`` scope argument."""
+    """Runtime validation of the ``iter_live_content`` scope argument
+    (Issue 15: non-negative int, not bool)."""
     if scope is None:
         return None
-    if not isinstance(scope, int) or isinstance(scope, bool):
-        raise TypeError("scope must be an int novel id or None")
+    if isinstance(scope, bool) or not isinstance(scope, int) or scope < 0:
+        raise TypeError(f"scope must be a non-negative int novel id or None, got {type(scope).__name__}")
     return scope
+
+
+def translate_sqlite(exc: BaseException, *, what: str) -> NoReturn:
+    """Translate any leftover SQLite error after typed classification (A.1).
+
+    Busy/locked -> :class:`Busy`; other ``sqlite3.Error`` -> ``InkpackError``
+    with context; already-typed errors pass through unchanged.
+    """
+    if isinstance(exc, sqlite3.Error) and _is_busy(exc):
+        raise Busy(str(exc)) from exc
+    if isinstance(exc, sqlite3.Error):
+        raise InkpackError(f"{what}: {exc}") from exc
+    raise exc
 
 
 def _map_busy(exc: sqlite3.Error) -> None:
     """Translate a sqlite busy/locked error into :class:`Busy` (locked
     semantics S8: open/migrate/validation paths must not leak raw errors)."""
-    if _is_busy(exc):
-        raise Busy(str(exc)) from exc
+    translate_sqlite(exc, what="sqlite operation")
 
 
 def _split_statements(script: str) -> list[str]:
     return [stmt.strip() for stmt in script.split(";") if stmt.strip()]
+
+
+def _apply_index_migrations(conn: sqlite3.Connection) -> None:
+    """Apply pending index migrations; the caller owns the transaction."""
+    current = int(conn.execute("PRAGMA user_version").fetchone()[0])
+    for version, script in MIGRATIONS:
+        if version <= current:
+            continue
+        for stmt in _split_statements(script):
+            conn.execute(stmt)
+        conn.execute(f"PRAGMA user_version={version}")
 
 
 def migrate_index(conn: sqlite3.Connection) -> None:
@@ -315,18 +339,12 @@ def migrate_index(conn: sqlite3.Connection) -> None:
     transaction (review L27: ``executescript`` would implicitly COMMIT)."""
     try:
         conn.execute("BEGIN")
-        current = int(conn.execute("PRAGMA user_version").fetchone()[0])
-        for version, script in MIGRATIONS:
-            if version <= current:
-                continue
-            for stmt in _split_statements(script):
-                conn.execute(stmt)
-            conn.execute(f"PRAGMA user_version={version}")
+        _apply_index_migrations(conn)
         conn.commit()
-    except sqlite3.OperationalError as exc:
+    except sqlite3.Error as exc:
         with suppress(sqlite3.Error):
             conn.rollback()
-        _map_busy(exc)
+        translate_sqlite(exc, what="index migration")
         raise
 
 
@@ -336,27 +354,32 @@ def _payload_version(conn: sqlite3.Connection) -> int:
     return int(row[0]) if row is not None else 0
 
 
+def _apply_payload_migrations(conn: sqlite3.Connection) -> None:
+    """Apply pending payload migrations; the caller owns the transaction."""
+    conn.execute(_PAYLOAD_VERSION_TABLE)
+    current = _payload_version(conn)
+    for version, script in PAYLOAD_MIGRATIONS:
+        if version <= current:
+            continue
+        for stmt in _split_statements(script):
+            conn.execute(stmt.format(p=""))  # Issue 43: tokenized schema
+        conn.execute(
+            "INSERT INTO _inkpack_schema(key, version) VALUES('payload', ?) "
+            "ON CONFLICT(key) DO UPDATE SET version=excluded.version",
+            (version,),
+        )
+
+
 def migrate_payload(conn: sqlite3.Connection) -> None:
     """Run payload migrations inside ONE explicit transaction (idempotent)."""
     try:
         conn.execute("BEGIN")
-        conn.execute(_PAYLOAD_VERSION_TABLE)
-        current = _payload_version(conn)
-        for version, script in PAYLOAD_MIGRATIONS:
-            if version <= current:
-                continue
-            for stmt in _split_statements(script):
-                conn.execute(stmt)
-            conn.execute(
-                "INSERT INTO _inkpack_schema(key, version) VALUES('payload', ?) "
-                "ON CONFLICT(key) DO UPDATE SET version=excluded.version",
-                (version,),
-            )
+        _apply_payload_migrations(conn)
         conn.commit()
-    except sqlite3.OperationalError as exc:
+    except sqlite3.Error as exc:
         with suppress(sqlite3.Error):
             conn.rollback()
-        _map_busy(exc)
+        translate_sqlite(exc, what="payload migration")
         raise
 
 
@@ -365,7 +388,8 @@ def migrate_payload_attached(conn: sqlite3.Connection) -> None:
 
     Runs inside the caller's transaction; the version table lives in the
     shard (``p._inkpack_schema``), so each shard tracks its own payload
-    schema version independently of the index.
+    schema version independently of the index. DDL statements use the
+    ``{p}`` token (Issue 43) instead of string replacement.
     """
     conn.execute(
         "CREATE TABLE IF NOT EXISTS p._inkpack_schema(key TEXT PRIMARY KEY, version INTEGER NOT NULL)"
@@ -376,7 +400,7 @@ def migrate_payload_attached(conn: sqlite3.Connection) -> None:
         if version <= current:
             continue
         for stmt in _split_statements(script):
-            conn.execute(stmt.replace("payload", "p.payload", 1))
+            conn.execute(stmt.format(p="p."))
         conn.execute(
             "INSERT INTO p._inkpack_schema(key, version) VALUES('payload', ?) "
             "ON CONFLICT(key) DO UPDATE SET version=excluded.version",
@@ -427,76 +451,60 @@ class Session:
         try:
             row = self.conn.execute(sql, params).fetchone()
             return cast("sqlite3.Row | None", row)
-        except sqlite3.OperationalError as exc:
-            if _is_busy(exc):
-                raise Busy(str(exc)) from exc
-            raise
+        except sqlite3.Error as exc:
+            translate_sqlite(exc, what="query")
 
     def query_all(self, sql: str, params: tuple[Any, ...] = ()) -> list[sqlite3.Row]:
         try:
             return cast("list[sqlite3.Row]", self.conn.execute(sql, params).fetchall())
-        except sqlite3.OperationalError as exc:
-            if _is_busy(exc):
-                raise Busy(str(exc)) from exc
-            raise
+        except sqlite3.Error as exc:
+            translate_sqlite(exc, what="query")
 
     def execute(self, sql: str, params: tuple[Any, ...] = ()) -> int:
         try:
             return int(self.conn.execute(sql, params).rowcount)
-        except sqlite3.OperationalError as exc:
-            if _is_busy(exc):
-                raise Busy(str(exc)) from exc
-            raise
+        except sqlite3.Error as exc:
+            translate_sqlite(exc, what="execute")
 
     def executemany(self, sql: str, seq: Iterable[tuple[Any, ...]]) -> None:
         try:
             self.conn.executemany(sql, seq)
-        except sqlite3.OperationalError as exc:
-            if _is_busy(exc):
-                raise Busy(str(exc)) from exc
-            raise
+        except sqlite3.Error as exc:
+            translate_sqlite(exc, what="execute")
 
     def config(self, key: str) -> Any:
         row = self.query_one("SELECT value_json FROM repo_config WHERE key=?", (key,))
         return None if row is None else loads_config(str(row[0]), key=key)
 
     def _shard_conn(self, shard_id: int) -> sqlite3.Connection | None:
-        """Open (and cache) a shard connection; returns None when the shard
-        file is missing — a missing shard behaves like missing content and is
-        never created by a read path (review P0-2, P1-SHARD-1).
+        """Open (and cache) a shard connection for READ probes (Issue 17/32).
 
-        Error classification: missing file -> None (negative cache); busy ->
-        :class:`Busy`; anything else (e.g. a corrupt shard file) ->
-        :class:`CorruptContent` — never a raw sqlite error.
+        The file's existence is checked FIRST (never parse SQLite's English
+        error text): a missing file is negative-cached and returns None
+        (missing content). Busy and other typed errors propagate unchanged
+        (Issue 3 — a locked shard is Busy, never CorruptContent). Reads never
+        migrate the shard schema (Issue 32: migrations are open/writer-only).
         """
         if shard_id in self._missing_shards:
             return None
         conn = self._shard_conns.get(shard_id)
         if conn is not None:
             return conn
+        shard_path = self.backend.shard_path(shard_id)
+        if not shard_path.exists():
+            self._missing_shards.add(shard_id)
+            return None
         try:
-            conn = connect_file(
-                self.backend.shard_path(shard_id), self.backend.busy_timeout_ms, self.backend.synchronous
-            )
+            conn = connect_file(shard_path, self.backend.busy_timeout_ms, self.backend.synchronous)
+        except (Busy, CorruptContent, MissingContent, NotFound):
+            raise
         except sqlite3.Error as exc:
-            message = str(exc).lower()
-            if "unable to open database file" in message:
-                self._missing_shards.add(shard_id)  # negative cache
-                return None
             if _is_busy(exc):
                 raise Busy(str(exc)) from exc
             raise CorruptContent(f"shard {shard_id} is present but unusable: {exc}") from exc
         except InkpackError as exc:
-            message = str(exc).lower()
-            if "unable to open database file" in message:
-                self._missing_shards.add(shard_id)  # negative cache
-                return None
-            raise CorruptContent(f"shard {shard_id} is present but unusable: {exc}") from exc
-        try:
-            migrate_payload(conn)  # idempotent; keeps existing shards current (M10)
-        except sqlite3.Error as exc:
-            conn.close()
-            _map_busy(exc)
+            # connect_file maps busy -> Busy and other failures -> InkpackError;
+            # a present-but-unreadable file is corruption.
             raise CorruptContent(f"shard {shard_id} is present but unusable: {exc}") from exc
         self._shard_conns[shard_id] = conn
         return conn
@@ -527,22 +535,6 @@ class Session:
             conn, "SELECT 1 FROM payload WHERE blob_key=? AND profile=?", (blob_key, profile)
         )
         return row is not None
-
-    def payload(self, blob_key: str, profile: str, shard_id: int | None) -> bytes | None:
-        if self.backend.mode == "sqlite_single":
-            row = self.query_one(
-                "SELECT data FROM payload WHERE blob_key=? AND profile=?", (blob_key, profile)
-            )
-            return None if row is None else bytes(row[0])
-        if shard_id is None:
-            return None
-        conn = self._shard_conn(int(shard_id))
-        if conn is None:
-            return None
-        row = self._shard_query_one(
-            conn, "SELECT data FROM payload WHERE blob_key=? AND profile=?", (blob_key, profile)
-        )
-        return None if row is None else bytes(row[0])
 
     def dict_bytes(self, dict_id: str) -> bytes | None:
         if dict_id not in self._dict_cache:
@@ -648,10 +640,12 @@ class SqliteBackend:
         """
         if mode not in ("sqlite_single", "sqlite_sharded"):
             raise ValueError(f"mode must be 'sqlite_single' or 'sqlite_sharded', got {mode!r}")
-        shard_cap_bytes = _require_positive_int(shard_cap_bytes, "shard_cap_bytes")
-        shard_min_bytes = _require_positive_int(shard_min_bytes, "shard_min_bytes")
-        if shard_min_bytes > shard_cap_bytes:
-            raise ValueError("shard_min_bytes must not exceed shard_cap_bytes")
+        if mode == "sqlite_sharded":
+            # Issue 16: shard caps are sharded-only knobs.
+            shard_cap_bytes = _require_positive_int(shard_cap_bytes, "shard_cap_bytes")
+            shard_min_bytes = _require_positive_int(shard_min_bytes, "shard_min_bytes")
+            if shard_min_bytes > shard_cap_bytes:
+                raise ValueError("shard_min_bytes must not exceed shard_cap_bytes")
 
         pragmas = _normalize_pragmas(pragmas)
         clock = clock or SystemClock()
@@ -681,10 +675,21 @@ class SqliteBackend:
                     except sqlite3.OperationalError as exc:
                         _map_busy(exc)
                         raise
-                migrate_index(conn)
-                migrate_payload(conn)
-                if create and initial_config:
-                    _write_initial_config(conn, initial_config)
+                    # Issue 10: schema + initial config in ONE transaction.
+                    conn.execute("BEGIN")
+                    try:
+                        _apply_index_migrations(conn)
+                        _apply_payload_migrations(conn)
+                        if initial_config:
+                            _write_initial_config(conn, initial_config)
+                        conn.commit()
+                    except BaseException:
+                        with suppress(sqlite3.Error):
+                            conn.rollback()
+                        raise
+                else:
+                    migrate_index(conn)
+                    migrate_payload(conn)
             finally:
                 conn.close()
         else:
@@ -704,9 +709,19 @@ class SqliteBackend:
                     except sqlite3.OperationalError as exc:
                         _map_busy(exc)
                         raise
-                migrate_index(conn)
-                if create and initial_config:
-                    _write_initial_config(conn, initial_config)
+                    # Issue 10: schema + initial config in ONE transaction.
+                    conn.execute("BEGIN")
+                    try:
+                        _apply_index_migrations(conn)
+                        if initial_config:
+                            _write_initial_config(conn, initial_config)
+                        conn.commit()
+                    except BaseException:
+                        with suppress(sqlite3.Error):
+                            conn.rollback()
+                        raise
+                else:
+                    migrate_index(conn)
             finally:
                 conn.close()
             if create:
@@ -811,9 +826,9 @@ class SqliteBackend:
                 assert shard_path is not None
                 try:
                     conn.execute("ATTACH DATABASE ? AS p", (sqlite_uri(shard_path, "rw"),))
-                    migrate_payload_attached(conn)  # M10: keep attached shards current
                 except sqlite3.Error as exc:
-                    _map_busy(exc)
+                    if _is_busy(exc):
+                        raise Busy(str(exc)) from exc
                     if "unable to open database" in str(exc).lower():
                         # The file vanished between the exists() check and the
                         # ATTACH: missing content, never create (review M14).
@@ -823,16 +838,17 @@ class SqliteBackend:
                     raise CorruptContent(
                         f"shard {attach_shard_id} is present but unusable: {exc}"
                     ) from exc
-                attached = True
+                attached = True  # set BEFORE migrate so a failed migrate still DETACHes (Issue 4)
+                if write:
+                    # Migrations are writer-only (Issue 32): read attaches never DDL.
+                    migrate_payload_attached(conn)
             conn.execute("BEGIN IMMEDIATE" if write else "BEGIN")
             yield conn
             conn.commit()
-        except sqlite3.OperationalError as exc:
+        except sqlite3.Error as exc:
             with suppress(sqlite3.Error):
                 conn.rollback()
-            if _is_busy(exc):
-                raise Busy(str(exc)) from exc
-            raise
+            translate_sqlite(exc, what="transaction")
         except BaseException:
             # Rollback errors must not mask the original failure (D9).
             with suppress(sqlite3.Error):
@@ -1035,22 +1051,6 @@ class SqliteBackend:
             if _is_busy(exc):
                 raise Busy(str(exc)) from exc
             raise CorruptContent(f"shard {sid} is present but unusable: {exc}") from exc
-
-    def payload_exists(self, blob_key: str, profile: str, shard_id: int | None) -> bool:
-        """Cheap existence probe (``SELECT 1``) — never fetches the whole BLOB
-        (review P2-EXISTS-1)."""
-        if self.mode == "sqlite_single":
-            row = self._query_one(
-                "SELECT 1 FROM payload WHERE blob_key=? AND profile=?", (blob_key, profile)
-            )
-            return row is not None
-        if shard_id is None or not self.shard_path(int(shard_id)).exists():
-            return False
-        with self.txn(write=False, attach_shard_id=int(shard_id)) as conn:
-            row = conn.execute(
-                "SELECT 1 FROM p.payload WHERE blob_key=? AND profile=?", (blob_key, profile)
-            ).fetchone()
-        return row is not None
 
     # -- dictionaries ---------------------------------------------------------
 
@@ -1484,6 +1484,23 @@ class SqliteBackend:
                                 )
                             check_cancel(cancel)
                     check_cancel(cancel)
+                # Issue 18: sweep payloads parked at the WRONG shard (locator
+                # moved but the old shard still holds bytes). encodings is the
+                # main/index table on this connection.
+                if self.mode == "sqlite_sharded":
+                    for sweep_sid in self.list_shards():
+                        check_cancel(cancel)
+                        with self.txn_on(
+                            s.conn, write=True, attach_shard_id=sweep_sid
+                        ) as conn:
+                            payload_rows_deleted += int(
+                                conn.execute(
+                                    "DELETE FROM p.payload WHERE NOT EXISTS ("
+                                    "SELECT 1 FROM encodings e "
+                                    "WHERE e.blob_key = p.payload.blob_key "
+                                    "AND e.profile = p.payload.profile)"
+                                ).rowcount
+                            )
             finally:
                 s.execute("DROP TABLE IF EXISTS temp_live")
                 s.execute("DROP TABLE IF EXISTS temp_dead")

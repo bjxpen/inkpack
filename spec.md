@@ -1690,3 +1690,34 @@ factories. The exists-check (markers or `payload/shard-*.sqlite`) runs BEFORE
 **D12 — Delete is catalog-only.** No `delete(..., reclaim=True)`; the
 two-step `delete_chapter` + `gc(iter_live_content())` is spec-locked and
 documented in the README.
+
+## N) Locked decisions (fifth review)
+
+**N1 — S1 abandonment is deterministic on `close()` / `with op:` / `.result`;
+discarded half-consumed iterators are best-effort.** `Operation` is driven by
+a real iterator object (never a generator wrapping a generator), so a stale
+outer iterator being closed can never clobber a completed operation's result.
+A consumer exception propagates to the caller and the operation stays usable.
+
+**N2 — Read operations MUST NOT perform schema migrations or DDL.** Migrations
+occur at open or during writer operations. `txn_on(write=False)` never
+migrates; `Session._shard_conn` (a read helper) never migrates; write attaches
+migrate (cached per session).
+
+**N3 — `size_hint` stays advisory** (no cap; not a routing input).
+
+**N4 — `ikb1` parse aligns with S4 exactly: leading zeros allowed.**
+
+**N5 — A failed write after shard rollover may leave an empty
+`payload/shard-NNNN.sqlite`.** Harmless: later writes may reuse it and it is
+never treated as repository contents on its own. No retract.
+
+**N6 — The write pointer is the highest shard id; `compact()` does not move
+writes backward.** Empty low shards stay until an admin deletes them.
+
+**N7 — Put success ⇒ payload row + required dict exist at commit.** A
+present-but-corrupt payload is NOT decoded on the dedupe-hit path.
+
+**N8 — GC computes `temp_dead` once under exclusive writers; a racing writer
+is `Busy`. GC additionally sweeps payloads parked at a shard different from
+their `encodings.shard_id` locator (wrong-shard orphans).**

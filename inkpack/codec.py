@@ -23,10 +23,11 @@ CHUNK_SIZE = 128 * 1024
 # Strict ASCII-canonical ikb1 key format (locked semantics S4): ASCII digits
 # only, lowercase hex, exact lengths. Unicode digits, uppercase hex, other
 # prefixes and malformed lengths are all rejected.
-# Strict ASCII-canonical ikb1 key format (locked semantics S4 + review M17):
-# ASCII digits only (no leading zeros), lowercase hex, exact lengths, and a
-# hard end anchor so a trailing newline is rejected.
-_IKB1_RE = re.compile(r"^ikb1:(0|[1-9][0-9]*):[0-9a-f]{64}:[0-9a-f]{32}\Z")
+# Strict ASCII-canonical ikb1 key format (locked semantics S4 / Issue 14):
+# ASCII digits (leading zeros ALLOWED per S4), lowercase hex, exact lengths,
+# and a hard end anchor so a trailing newline is rejected. Keys this process
+# writes never have leading zeros; parse accepts the documented alphabet.
+_IKB1_RE = re.compile(r"^ikb1:[0-9]+:[0-9a-f]{64}:[0-9a-f]{32}\Z")
 
 
 def canonical_json(obj: Any) -> str:

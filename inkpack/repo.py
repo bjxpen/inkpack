@@ -56,10 +56,7 @@ class Repository:
         if not isinstance(cast("Any", profile), Profile):
             raise TypeError(f"profile must be a Profile instance, got {type(profile).__name__}")
         validate_profiles({profile.name: profile})
-        if profile.zstd_dict_id is not None and self.backend.get_dict(profile.zstd_dict_id) is None:
-            raise MissingContent(
-                f"dictionary {profile.zstd_dict_id!r} does not exist in this repository"
-            )
+        self._require_known_dicts({profile.name: profile})
 
         def _merge(current: Any) -> dict[str, Any]:
             profiles = profiles_from_config(current)
@@ -71,11 +68,26 @@ class Repository:
     def set_profiles(self, profiles: dict[str, Profile]) -> None:
         """Replace the whole profile set and persist it in the repo config.
 
-        The set must be non-empty and every entry valid; existing stored
+        The set must be non-empty, every entry valid, and every referenced
+        dictionary must exist in this repository (Issue 12). Existing stored
         content is unaffected (decoding never consults profiles, spec 6.2).
         """
         validate_profiles(profiles)
+        self._require_known_dicts(profiles)
         self.backend.config_set("profiles", profiles_to_config(profiles))
+
+    def _require_known_dicts(self, profiles: dict[str, Profile]) -> None:
+        """Raise MissingContent listing dictionary ids referenced by profiles
+        that do not exist in this repository (Issue 12)."""
+        missing = sorted(
+            p.zstd_dict_id
+            for p in profiles.values()
+            if p.zstd_dict_id is not None and self.backend.get_dict(p.zstd_dict_id) is None
+        )
+        if missing:
+            raise MissingContent(
+                "dictionaries do not exist in this repository: " + ", ".join(missing)
+            )
 
     # -- novels / chapters ---------------------------------------------------
 
@@ -142,9 +154,6 @@ class Repository:
     @staticmethod
     def _require_pk_public(value: Any, label: str) -> int:
         """Validate a primary-key argument (M16: int, not bool, non-negative)."""
-        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-            raise TypeError(f"{label} must be a non-negative int, got {type(value).__name__}")
-        return value
         if isinstance(value, bool) or not isinstance(value, int) or value < 0:
             raise TypeError(f"{label} must be a non-negative int, got {type(value).__name__}")
         return value
@@ -254,7 +263,7 @@ class Repository:
             self.store.check_blob_limit(prepared.enc.stored_len, s.conn)
             shard_id = backend.resolve_write_shard(prepared.enc.stored_len, prepared.shard_id)
             if backend.mode == "sqlite_sharded":
-                s._missing_shards.discard(shard_id)
+                s.forget_missing_shard(shard_id)
             prepared = PreparedPut(
                 prepared.blob_key, prepared.raw_len, prepared.profile, prepared.enc, shard_id
             )
@@ -309,10 +318,10 @@ class Repository:
         return ContentRef(blob_key=str(row["blob_key"]), profile=str(row["profile"]))
 
     def get_chapter_bytes(self, chapter_id: int) -> bytes:
-        return self.store.get_bytes(self._chapter_ref(int(chapter_id)))
+        return self.store.get_bytes(self._chapter_ref(chapter_id))
 
     def open_chapter(self, chapter_id: int) -> io.BytesIO:
-        return self.store.open(self._chapter_ref(int(chapter_id)))
+        return self.store.open(self._chapter_ref(chapter_id))
 
     def meta_set(self, entity_type: str, entity_id: int | str, key: str, value: Any) -> None:
         self.backend.meta_set(entity_type, entity_id, key, value)

@@ -31,6 +31,8 @@ from .codec import (
 )
 from .sqlite import Session, SqliteBackend
 from .types import (
+    Busy,
+    Cancelled,
     CancelToken,
     CompactResult,
     ContentRef,
@@ -55,6 +57,16 @@ _SPOOL_MAX_SIZE = 2 * 1024 * 1024
 PROGRESS_INTERVAL = 8 * 1024 * 1024
 _PAGE_SIZE = 500
 _VERIFY_ITEM_INTERVAL = 32
+
+
+def require_shard_id(shard_id: int | None, ref: ContentRef) -> int:
+    """A.2: a shard locator is required before any ``p.payload`` SQL. A NULL
+    locator means the content cannot be located: MissingContent (reads) or a
+    rehome trigger (puts with raw bytes — callers must NOT call this on that
+    path)."""
+    if shard_id is None:
+        raise MissingContent(f"encoding for {ref} has no shard locator")
+    return int(shard_id)
 
 
 class RepairRequired(Exception):
@@ -582,6 +594,13 @@ class BlobStore:
         if peek is None:
             raise MissingContent(f"encoding not found for {ref}")
         for _attempt in range(2):
+            if self.backend.mode == "sqlite_sharded":
+                if peek["shard_id"] is None:
+                    # A.2 (Issue 1): a NULL locator is missing content on the
+                    # read path; never probe p.payload without an attach.
+                    raise MissingContent(f"encoding for {ref} has no shard locator")
+                if not self.backend.shard_path(int(peek["shard_id"])).exists():
+                    raise MissingContent(f"shard file missing for {ref}")
             attach = (
                 int(peek["shard_id"])
                 if (self.backend.mode == "sqlite_sharded" and peek["shard_id"] is not None)
@@ -865,10 +884,23 @@ class BlobStore:
                     checked += 1
                     try:
                         raw = self._read_snapshot(s, str(row["blob_key"]), str(row["profile"]))
+                    except Busy:
+                        raise
+                    except Cancelled:
+                        raise
                     except MissingContent:
                         missing += 1
                     except CorruptContent:
                         corrupt += 1
+                    except InkpackError:
+                        raise  # schema/config — not a per-row finding
+                    except Exception as exc:
+                        corrupt += 1  # unexpected decode/identity bugs only
+                        yield OpEvent(
+                            kind="log",
+                            op="verify",
+                            message=f"unexpected per-row error for {row['blob_key']}: {exc}",
+                        )
                     else:
                         try:
                             expected_len, expected_sha, expected_blake = self.identity.parse(
@@ -888,7 +920,8 @@ class BlobStore:
                             corrupt += 1
                     if checked % THROTTLE == 0:
                         yield emit_item()
-                yield emit_item()  # final exact counts
+                if checked % THROTTLE != 0:
+                    yield emit_item()  # final exact counts (Issue 47)
             result = VerifyResult(checked=checked, ok=ok, missing=missing, corrupt=corrupt)
             yield OpEvent(kind="done", op="verify", metrics={"checked": checked, "ok": ok})
             return result

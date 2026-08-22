@@ -92,6 +92,9 @@ chapter_id = repo.upsert_chapter(
 assert repo.get_chapter_bytes(chapter_id) == b"once upon a time..."
 assert repo.open_chapter(chapter_id).read() == b"once upon a time..."
 
+`store.has_blob(key)` is True iff a `blobs` catalog row exists (decision A)
+— it does not mean this `ContentRef` is currently readable.
+
 repo.meta_set("novel", novel_id, "rating", 5)
 repo.meta_get("novel", novel_id, "rating")   # 5
 repo.meta_list("chapter", chapter_id)        # {"words": 4200, ...}
@@ -149,11 +152,14 @@ result = op.result                               # after completion
 
 Operations are single-use: iterate once (or just read `.result`).
 
-Abandonment is **deterministic** (locked semantics S1): `op.close()`, the
-`with op:` context manager, or discarding the iterator prevents an unstarted
-operation from running, releases its resources immediately (no waiting for
-garbage collection), and makes `.result` raise `Cancelled`. A completed
-operation keeps its result; `.result` never returns `None` as a stand-in.
+Abandonment is **deterministic** for `op.close()`, the `with op:` context
+manager, and `.result` (locked semantics S1): a closed operation prevents an
+unstarted run, releases its resources immediately, and makes `.result` raise
+`Cancelled`. A completed operation keeps its result; `.result` never returns
+`None` as a stand-in. Discarding a half-consumed iterator is best-effort (the
+iterator object's close runs deterministically; CPython additionally delivers
+`GeneratorExit` during for-loop unwind). Closing a never-started operation
+warns.
 Stream puts (`put_stream`, `upsert_chapter_stream`) emit `progress` events
 **live** while the source stream is being hashed — and the identity is
 computed exactly once (the spooled bytes are never re-hashed).
@@ -163,7 +169,7 @@ computed exactly once (the spooled bytes are never re-hashed).
 | Call | Result |
 | --- | --- |
 | `store.put_bytes(data, profile, cancel=None)` | `PutResult` |
-| `store.put_stream(fp, profile, size_hint=None, cancel=None)` | `PutResult` |
+| `store.put_stream(fp, profile, size_hint=None, cancel=None)` | `PutResult` (`size_hint` is advisory) |
 | `store.get_bytes(ref)` / `store.open(ref)` | `bytes` / `io.BytesIO` (not operations) |
 | `store.has_blob(blob_key)` | `bool` (not an operation) |
 | `store.train_dict(samples, options=None, cancel=None)` | `TrainDictResult` |
@@ -349,7 +355,10 @@ DBs). Key invariants:
   not to one chapter. For codec `none`, the raw length IS the stored length,
   so the cap applies to canonical bytes too. A stream put that misses (or
   repairs) still peaks at ~raw + encoded + zstd scratch — the spool avoids
-  re-reading the source, not the materialization of a miss.
+  re-reading the source, not the materialization of a miss. A failed write
+  after shard rollover may leave an empty `payload/shard-NNNN.sqlite`; that
+  file is harmless — later writes may reuse it and it is never treated as
+  repository contents on its own.
 - `blob_key` is `ikb1:<raw_len>:<sha256_hex>:<blake2b-128_hex>` and is unique
   (`blobs` PK; `encodings` PK is `(blob_key, profile)`). Parsing is strict
   ASCII canonical (S4): Unicode digits, uppercase hex and other prefixes are
@@ -434,7 +443,9 @@ open_repo(path, pragmas=None, *, identity=None, codec=None, clock=None) -> Repos
 - `verify_on_read`: when `True`, `get_bytes`/`open` recompute the identity
   and raise `CorruptContent` on mismatch (slower; `verify()` is the default
   full check). Read once per call.
-- `identity` / `codec` / `clock`: dependency-injection hooks (see below).
+- `identity` / `codec` / `clock`: dependency-injection hooks (see below). A
+  custom `Identity` must implement `hasher()` — `put_stream` /
+  `upsert_chapter_stream` hash through the incremental hasher.
 - `shard_cap_bytes`/`shard_min_bytes` apply to `sqlite_sharded` only.
   `shard_min_bytes` is the allowed floor for `shard_cap_bytes` (must be a
   positive int, `min ≤ cap`); **routing uses only `shard_cap_bytes`** (D4) —
@@ -444,6 +455,9 @@ open_repo(path, pragmas=None, *, identity=None, codec=None, clock=None) -> Repos
   opens 1 connection, `verify`/`reencode`/`gc` are O(1)-O(shards) connections
   instead of one per row, and GC's TEMP tables live for the whole operation.
   `compact()` still VACUUMs on a virgin connection with no attached databases.
+- **Write pointer (N6).** Writes go to the highest shard id; `compact()` does
+  not move writes backward, and empty low shards stay until an admin deletes
+  them.
 - **Snapshot reads (D1).** Every read of encodings + payload is ONE snapshot:
   sharded reads `ATTACH` the shard to the index connection inside the read
   transaction — never a second connection.

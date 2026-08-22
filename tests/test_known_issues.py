@@ -119,7 +119,7 @@ def test_h1_stale_row_plus_new_payload_is_not_a_public_success(repo):
     # A stale row (codec 'none') paired with the NEW zstd payload must not
     # silently decode: the S3 length bound rejects it.
     with store.backend.session() as s:
-        new_payload = s.payload(ref.blob_key, ref.profile, stale["shard_id"])
+        new_payload = store.backend.get_payload(ref.blob_key, ref.profile, stale["shard_id"])
         with pytest.raises(CorruptContent):
             store._decode_from_row(s, stale, new_payload)
     # Public API returns the original bytes from a fresh snapshot.
@@ -246,14 +246,12 @@ def test_h5_create_refuses_orphan_payload_shards(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_m6_consumer_exception_closes_generator():
-    """D10: a consumer exception deterministically closes the generator
-    (resources released now, not at GC). On CPython, the for-loop delivers
-    GeneratorExit into a generator-method ``__iter__`` during the unwind, so
-    ``.result`` surfaces the deterministic abandonment state (Cancelled) —
-    the consumer's own exception is never visible to the operation."""
-    from inkpack.types import Cancelled as CancelledType
-
+def test_m6_consumer_exception_propagates_and_op_stays_usable():
+    """D10 with the iterator-object design (Issue 2/B): a consumer exception
+    raised in the loop body propagates to the caller; the operation is not
+    cancelled by it and can still complete via .result. The old generator-
+    wrapper delivered GeneratorExit into __iter__; the real iterator object
+    does not."""
     closed = {"n": 0}
 
     def factory():
@@ -266,14 +264,14 @@ def test_m6_consumer_exception_closes_generator():
             closed["n"] += 1
 
     op = Operation(factory)
+    it = iter(op)
+    assert next(it).kind == "start"
     with pytest.raises(RuntimeError, match="boom"):
-        for ev in op:
+        for ev in it:
             if ev.kind == "item":
                 raise RuntimeError("boom")
-
-    assert closed["n"] == 1  # generator closed deterministically
-    with pytest.raises(CancelledType):
-        _ = op.result
+    assert op.result == 1
+    assert closed["n"] == 1
 
 
 # ---------------------------------------------------------------------------
@@ -544,10 +542,13 @@ def test_m17_parse_rejects_trailing_newline():
         parse_blob_key_ikb1(key + "\n")
 
 
-def test_m17_parse_rejects_leading_zero():
-    key, _, sha, blake = IKB1.key_bytes(b"x")
-    with pytest.raises(ValueError):
-        parse_blob_key_ikb1(f"ikb1:0{key.split(':')[1]}:{sha}:{blake}")
+def test_parse_accepts_s4_leading_zeros():
+    """Issue 14: S4 allows leading zeros in the length field."""
+    key = "ikb1:01:" + ("ab" * 32) + ":" + ("cd" * 16)
+    raw_len, sha, blake = parse_blob_key_ikb1(key)
+    assert raw_len == 1
+    assert sha == "ab" * 32
+    assert blake == "cd" * 16
 
 
 # ---------------------------------------------------------------------------

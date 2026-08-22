@@ -13,9 +13,10 @@ from __future__ import annotations
 
 import os
 import shutil
+import time
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from .blobstore import BlobStore
 from .codec import IKB1, CodecEngine, Identity
@@ -65,6 +66,28 @@ def _build_repository(
     )
 
 
+def _sweep_stale_creating_dirs(parent: Path) -> None:
+    """Remove stale ``.inkpack-creating-*`` temp dirs (Issue 46).
+
+    Only in ``create_repo`` (open has no filesystem side effects). Only
+    siblings of the destination with the exact name pattern and mtime older
+    than 1 hour are removed, so a concurrent create (different UUID) is
+    never touched. The grace period is the mitigation, not a lock.
+    """
+    if not parent.is_dir():
+        return
+    cutoff = time.time() - 3600
+    for child in parent.iterdir():
+        name = child.name
+        if not (name.startswith(".inkpack-creating-") and len(name) == len(".inkpack-creating-") + 32):
+            continue
+        try:
+            if child.stat().st_mtime < cutoff:
+                shutil.rmtree(child, ignore_errors=True)
+        except OSError:
+            continue
+
+
 def _repo_markers_exist(root: Path) -> bool:
     """A path is already a repository if index/repo markers exist OR the
     payload dir holds any shard file (review H5)."""
@@ -107,13 +130,24 @@ def create_repo(
         raise InkpackError(f"cannot create repository at {root}: path exists and is not a directory")
     if root.exists() and any(root.iterdir()):
         raise InkpackError(f"cannot create repository at {root}: directory exists and is not empty")
+    _sweep_stale_creating_dirs(root.parent)  # Issue 46: only in create_repo
     profiles = validate_profiles(profiles)  # after the exists-check (D11/M24)
+    for name, profile in profiles.items():
+        if profile.zstd_dict_id is not None:
+            # Issue 12: a dictionary cannot exist before the repo does;
+            # attach dicts later via set_profile.
+            raise ValueError(
+                f"profile {name!r}: zstd_dict_id must be None when creating a repository "
+                "(train the dictionary and attach it with set_profile)"
+            )
     identity = identity or IKB1
+    if not isinstance(cast("Any", verify_on_read), bool):
+        raise TypeError(f"verify_on_read must be a bool, got {type(verify_on_read).__name__}")
     initial_config: dict[str, Any] = {
         "identity_policy": identity.name,
         "backend_mode": backend_mode,
         "profiles": profiles_to_config(profiles),
-        "verify_on_read": bool(verify_on_read),
+        "verify_on_read": verify_on_read,
     }
     if backend_mode == "sqlite_sharded":
         initial_config["shard_cap_bytes"] = int(shard_cap_bytes)
@@ -135,6 +169,8 @@ def create_repo(
         shutil.rmtree(tmp, ignore_errors=True)
         raise
     try:
+        if root.exists():
+            root.rmdir()  # empty only (Issue 13: os.replace onto a dir is not portable)
         os.replace(tmp, root)  # atomic; root absent or an empty dir
         backend.root = root
         backend.index_path = root / ("index.sqlite" if backend_mode == "sqlite_sharded" else "repo.sqlite")

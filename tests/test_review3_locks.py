@@ -85,8 +85,9 @@ def test_operation_context_manager_abandons_deterministically(repo):
 def test_abandoned_iteration_raises_cancelled(repo):
     repo.store.put_bytes(b"abandon", profile="raw").result
     op = repo.store.verify()
-    for _event in op:
-        break  # abandon mid-iteration
+    it = iter(op)
+    next(it)  # start and yield one event
+    it.close()  # explicit abandonment of the iterator
     with pytest.raises(Cancelled):
         _ = op.result
 
@@ -487,14 +488,15 @@ def test_options_validated_at_call_time(repo):
 # -- P2-EXISTS-1: backend payload_exists is a SELECT 1 probe ----------------------
 
 
-def test_backend_payload_exists_does_not_fetch_blob(repo_single, monkeypatch):
+def test_payload_exists_does_not_fetch_blob(repo_single, monkeypatch):
     ref = repo_single.store.put_bytes(b"abc" * 10, "raw").result.ref
 
     def boom(*args, **kwargs):
         raise AssertionError("must not fetch the whole blob")
 
     monkeypatch.setattr(repo_single.backend, "get_payload", boom)
-    assert repo_single.backend.payload_exists(ref.blob_key, ref.profile, None) is True
+    with repo_single.backend.session() as s:
+        assert s.payload_exists(ref.blob_key, ref.profile, None) is True
 
 
 # -- S6: entity id normalization ---------------------------------------------------

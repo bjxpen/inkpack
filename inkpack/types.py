@@ -9,7 +9,7 @@ internal and performs no sqlite/zstd work.
 from __future__ import annotations
 
 import warnings
-from collections.abc import Callable, Generator, Iterator, Mapping
+from collections.abc import Callable, Generator, Mapping
 from contextlib import suppress
 from dataclasses import dataclass, field
 from types import MappingProxyType
@@ -42,6 +42,48 @@ class OpEvent:
     metrics: dict[str, Any] | None = None
 
 
+class _OpIterator(Generic[T]):
+    """Single driver over an Operation's inner generator (Workstream B).
+
+    A real iterator object (not a generator wrapping a generator) so a stale
+    outer iterator being closed can never clobber a completed operation's
+    result (Issue 2). close()/GeneratorExit mark the operation Cancelled ONLY
+    when it is not already done.
+    """
+
+    def __init__(self, op: Operation[T]) -> None:
+        self.op = op
+        if op.iterator is None:
+            op.iterator = op.iterator_factory()
+        self._inner = op.iterator
+
+    def __iter__(self) -> _OpIterator[T]:
+        return self
+
+    def __next__(self) -> OpEvent:
+        if self.op.done:
+            raise StopIteration
+        try:
+            event = next(self._inner)
+        except StopIteration as stop:
+            self.op.result_value = cast("T", stop.value)
+            self.op.done = True
+            raise StopIteration from None
+        except BaseException as exc:
+            self.op.error = exc
+            self.op.done = True
+            self._inner.close()
+            raise
+        return event
+
+    def close(self) -> None:
+        if self.op.done:
+            return
+        self.op.done = True
+        self.op.error = Cancelled("operation abandoned before completion")
+        self._inner.close()
+
+
 class Operation(Generic[T]):
     """A lazily-executed long operation (spec 4.2).
 
@@ -50,61 +92,26 @@ class Operation(Generic[T]):
     the operation's result value, or re-raises the exception that aborted it.
 
     The operation is single-use: the underlying generator is created on first
-    iteration and consumed until exhaustion. The generator's ``return`` value
-    is captured as the operation result. Operations are not thread-safe: drive
-    one operation from one thread (review L27).
+    iteration and consumed until exhaustion; its ``return`` value is captured
+    as the operation result. Operations are not thread-safe: drive one
+    operation from one thread (review L27).
 
-    Abandonment is deterministic (locked semantics S1): ``close()`` (or the
-    ``with op:`` context manager, or discarding the iterator) prevents an
-    unstarted operation from running, releases resources immediately, and
-    makes ``.result`` raise :class:`Cancelled`.
+    Abandonment (locked semantics S1 / Issue 22): ``close()``, ``with op:``
+    and ``.result`` are deterministic on every interpreter. A discarded
+    half-consumed iterator is best-effort.
     """
 
     _UNSET = object()
 
     def __init__(self, iterator_factory: Callable[[], Generator[OpEvent, None, T]]) -> None:
-        self._iterator_factory = iterator_factory
-        self._iterator: Generator[OpEvent, None, T] | None = None
-        self._result: T | object = Operation._UNSET
-        self._error: BaseException | None = None
-        self._done = False
+        self.iterator_factory = iterator_factory
+        self.iterator: Generator[OpEvent, None, T] | None = None
+        self.result_value: T | object = Operation._UNSET
+        self.error: BaseException | None = None
+        self.done = False
 
-    def __iter__(self) -> Iterator[OpEvent]:
-        if self._done:
-            # Closed before starting (P0-OP-1): never start the generator.
-            return
-        if self._iterator is None:
-            self._iterator = self._iterator_factory()
-        iterator = self._iterator
-        try:
-            while True:
-                try:
-                    event = next(iterator)
-                except StopIteration as stop:
-                    # A generator's `return value` arrives via StopIteration.value.
-                    # Re-iterating an already-finished operation must not
-                    # clobber the captured result.
-                    if not self._done:
-                        self._result = cast("T", stop.value)
-                    self._done = True
-                    return
-                yield event
-        except GeneratorExit:
-            # The consumer abandoned iteration (P0-OP-2): mark the operation
-            # as cancelled deterministically — .result must not depend on GC
-            # or resume a half-run generator.
-            self._done = True
-            self._error = Cancelled("operation abandoned before completion")
-            iterator.close()
-            raise
-        except BaseException as exc:
-            # M6/D10: a consumer exception closes the generator (resources
-            # released now) and .result re-raises THAT exception — never
-            # translated into Cancelled.
-            self._error = exc
-            self._done = True
-            iterator.close()
-            raise
+    def __iter__(self) -> _OpIterator[T]:
+        return _OpIterator(self)  # exhausted immediately when _done
 
     def __enter__(self) -> Operation[T]:
         return self
@@ -113,45 +120,43 @@ class Operation(Generic[T]):
         self.close()
         return False
 
-    def close(self) -> None:
-        """Abandon the operation early, releasing any resources (e.g. the
-        operation-scoped database session) immediately.
+    def close(self, *, _warn: bool = True) -> None:
+        """Abandon the operation early, releasing any resources immediately.
 
-        Safe to call multiple times and on never-started operations. After
-        closing, ``.result`` raises :class:`Cancelled`.
+        After closing, ``.result`` raises :class:`Cancelled`. An explicit
+        close of a never-started operation warns (Issue 21 / M23); ``__del__``
+        suppresses the warning.
         """
-        if self._done:
+        if self.done:
             return
-        if self._iterator is None:
-            # M23/D10: closing a never-started operation silently drops its
-            # work; make that visible without eager-running anything.
-            warnings.warn(
-                "Operation closed before it started (never started); work did not run. "
-                "Use op.result or iterate it.",
-                stacklevel=2,
-            )
+        if self.iterator is None:
+            if _warn:
+                warnings.warn(
+                    "Operation closed before it started (never started); work did not run. "
+                    "Use op.result or iterate it.",
+                    stacklevel=2,
+                )
         else:
-            self._iterator.close()
-        self._done = True
-        self._error = Cancelled("operation closed before completion")
+            self.iterator.close()
+        self.done = True
+        self.error = Cancelled("operation closed before completion")
 
     def __del__(self) -> None:
         with suppress(Exception):
-            self.close()
+            self.close(_warn=False)
 
     @property
     def result(self) -> T:
-        if not self._done:
+        if not self.done:
             for _ in self:
                 pass
-        if self._error is not None:
-            raise self._error
-        if not self._done:
+        if self.error is not None:
+            raise self.error
+        if not self.done:
             raise InkpackError("operation was never fully iterated")
-        if self._result is Operation._UNSET:
-            # Never return None as a stand-in for a missing result (S1).
+        if self.result_value is Operation._UNSET:
             raise InkpackError("operation produced no result")
-        return cast("T", self._result)
+        return cast("T", self.result_value)
 
 
 @dataclass(frozen=True)
