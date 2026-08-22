@@ -56,7 +56,13 @@ def test_put_unknown_profile_raises(repo):
 
 
 def test_put_with_missing_dict_raises(repo):
-    repo.set_profile(Profile(name="broken", codec="zstd", params={"level": 3}, zstd_dict_id="ikd1:does-not-exist"))
+    # set_profile refuses a missing dictionary (M24)...
+    with pytest.raises(MissingContent):
+        repo.set_profile(Profile(name="broken", codec="zstd", params={"level": 3}, zstd_dict_id="ikd1:does-not-exist"))
+    # ...and a raw-injected missing dict fails at write time.
+    profiles = repo.backend.config_get("profiles")
+    profiles["broken"] = {"codec": "zstd", "params": {"level": 3}, "zstd_dict_id": "ikd1:does-not-exist"}
+    repo.backend.config_set("profiles", profiles)
     with pytest.raises(MissingContent):
         repo.store.put_bytes(b"x" * 100, profile="broken").result
 

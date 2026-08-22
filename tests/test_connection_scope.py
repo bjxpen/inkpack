@@ -13,10 +13,9 @@ def test_get_bytes_bounded_connects(repo, connect_counter):
     put = repo.store.put_bytes(b"bounded " * 100, profile="raw").result
     connect_counter["opens"] = 0
     assert repo.store.get_bytes(put.ref) == b"bounded " * 100
-    if repo.backend.mode == "sqlite_single":
-        assert connect_counter["opens"] == 1  # index conn only
-    else:
-        assert connect_counter["opens"] == 2  # index + one shard conn
+    # H1/D1: encodings + payload are read as ONE snapshot on the index
+    # connection (sharded reads ATTACH the shard; no second connection).
+    assert connect_counter["opens"] == 1
     assert connect_counter["live"] == 0  # closed after the call
 
 

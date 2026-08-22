@@ -86,7 +86,7 @@ def test_backend_open_sharded_does_not_create_payload_dir(tmp_path):
         path.unlink()
     payload.rmdir()
 
-    with pytest.raises(NotFound):
+    with pytest.raises(InkpackError):
         SqliteBackend.open(root, mode="sqlite_sharded", create=False)
     assert not payload.exists()
 

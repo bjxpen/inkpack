@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from inkpack import Profile
 
 from .conftest import enc_row, payload_bytes
@@ -22,8 +24,14 @@ def test_codec_params_json_is_canonical(repo):
     assert json.loads(row["codec_params_json"]) == {"level": 3}
 
 
-def test_none_codec_stores_empty_params_even_if_profile_has_params(repo):
-    repo.set_profile(Profile(name="raw_noisy", codec="none", params={"irrelevant": True}))
+def test_none_codec_rejects_params_at_set_time(repo):
+    # L27: codec 'none' takes no params — rejected eagerly by the wrapper.
+    with pytest.raises(ValueError, match="none"):
+        repo.set_profile(Profile(name="raw_noisy", codec="none", params={"irrelevant": True}))
+    # Defense in depth: raw-injected params are still ignored at encode time.
+    profiles = repo.backend.config_get("profiles")
+    profiles["raw_noisy"] = {"codec": "none", "params": {"irrelevant": True}, "zstd_dict_id": None}
+    repo.backend.config_set("profiles", profiles)
     put = repo.store.put_bytes(b"noisy", profile="raw_noisy").result
     row = enc_row(repo, put.ref)
     assert row["codec_params_json"] == "{}"

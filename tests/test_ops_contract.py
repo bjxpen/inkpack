@@ -106,7 +106,8 @@ def test_verify_item_events_reported(repo):
     for i in range(5):
         repo.store.put_bytes(f"item-{i}".encode(), profile="raw").result
     items = [e for e in repo.store.verify() if e.kind == "item"]
-    assert len(items) == 5
+    # Item events are throttled (M22): 5 rows -> the final exact-count item.
+    assert len(items) == 1
     assert items[-1].metrics == {"checked": 5, "ok": 5, "missing": 0, "corrupt": 0}
 
 

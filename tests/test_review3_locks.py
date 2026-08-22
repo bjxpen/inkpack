@@ -446,7 +446,9 @@ def test_put_stream_no_double_hash(repo, monkeypatch):
 
     monkeypatch.setattr(repo.store.identity, "key_bytes", spy)
     result = repo.store.put_stream(io.BytesIO(data), profile="raw").result
-    assert calls["n"] == 0  # streaming hasher computed the identity
+    # D6/M9: the streaming hasher computes the identity; a miss RE-BINDS with
+    # identity.key_bytes(raw) exactly once (never re-hashes inside prepare).
+    assert calls["n"] == 1
     assert repo.store.get_bytes(result.ref) == data
 
 

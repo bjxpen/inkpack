@@ -8,6 +8,7 @@ internal and performs no sqlite/zstd work.
 
 from __future__ import annotations
 
+import warnings
 from collections.abc import Callable, Generator, Iterator, Mapping
 from contextlib import suppress
 from dataclasses import dataclass, field
@@ -50,7 +51,8 @@ class Operation(Generic[T]):
 
     The operation is single-use: the underlying generator is created on first
     iteration and consumed until exhaustion. The generator's ``return`` value
-    is captured as the operation result.
+    is captured as the operation result. Operations are not thread-safe: drive
+    one operation from one thread (review L27).
 
     Abandonment is deterministic (locked semantics S1): ``close()`` (or the
     ``with op:`` context manager, or discarding the iterator) prevents an
@@ -96,8 +98,12 @@ class Operation(Generic[T]):
             iterator.close()
             raise
         except BaseException as exc:
+            # M6/D10: a consumer exception closes the generator (resources
+            # released now) and .result re-raises THAT exception — never
+            # translated into Cancelled.
             self._error = exc
             self._done = True
+            iterator.close()
             raise
 
     def __enter__(self) -> Operation[T]:
@@ -116,7 +122,15 @@ class Operation(Generic[T]):
         """
         if self._done:
             return
-        if self._iterator is not None:
+        if self._iterator is None:
+            # M23/D10: closing a never-started operation silently drops its
+            # work; make that visible without eager-running anything.
+            warnings.warn(
+                "Operation closed before it started (never started); work did not run. "
+                "Use op.result or iterate it.",
+                stacklevel=2,
+            )
+        else:
             self._iterator.close()
         self._done = True
         self._error = Cancelled("operation closed before completion")
@@ -132,7 +146,8 @@ class Operation(Generic[T]):
                 pass
         if self._error is not None:
             raise self._error
-        assert self._done, "operation was never fully iterated"
+        if not self._done:
+            raise InkpackError("operation was never fully iterated")
         if self._result is Operation._UNSET:
             # Never return None as a stand-in for a missing result (S1).
             raise InkpackError("operation produced no result")
@@ -342,6 +357,8 @@ def validate_profile_entry(name: Any, profile: Any) -> Profile:
         raise ValueError(f"profile {name!r}: unsupported codec {profile.codec!r}")
     if profile.zstd_dict_id is not None and profile.codec != "zstd":
         raise ValueError(f"profile {name!r}: zstd_dict_id requires codec 'zstd'")
+    if profile.codec == "none" and dict(profile.params):
+        raise ValueError(f"profile {name!r}: codec 'none' takes no params")
     if profile.codec == "zstd":
         params = dict(profile.params)
         unknown = set(params) - {"level"}

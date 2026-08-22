@@ -140,18 +140,11 @@ def test_gc_counts_match_dead_set(repo):
     assert repo.store.get_bytes(keep) == b"count-keep"
 
 
-def test_gc_does_not_materialize_dead_list(repo, monkeypatch):
-    """§15: production GC stages dead rows in SQL; the Python list helper is
-    never used by the operation."""
+def test_gc_does_not_materialize_dead_list(repo):
+    """L26: the Python list helper is gone; GC stages dead rows in SQL only."""
     repo.store.put_bytes(b"keep-a", profile="raw").result
     repo.store.put_bytes(b"dead-a", profile="raw").result
-    calls = {"n": 0}
-    original = repo.backend.list_dead_encodings
-
-    def spy(*args, **kwargs):
-        calls["n"] += 1
-        return original(*args, **kwargs)
-
-    monkeypatch.setattr(repo.backend, "list_dead_encodings", spy)
+    assert not hasattr(repo.backend, "list_dead_encodings")
     repo.store.gc(live=list(repo.iter_live_content())).result
-    assert calls["n"] == 0
+    assert_repo_consistent(repo)
+

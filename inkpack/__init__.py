@@ -12,6 +12,8 @@ and validates the stored ``identity_policy`` / ``backend_mode`` / profiles.
 from __future__ import annotations
 
 import os
+import shutil
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -63,6 +65,15 @@ def _build_repository(
     )
 
 
+def _repo_markers_exist(root: Path) -> bool:
+    """A path is already a repository if index/repo markers exist OR the
+    payload dir holds any shard file (review H5)."""
+    if (root / "index.sqlite").exists() or (root / "repo.sqlite").exists():
+        return True
+    payload = root / "payload"
+    return payload.is_dir() and any(payload.glob("shard-*.sqlite"))
+
+
 def create_repo(
     path: str | os.PathLike[str],
     backend_mode: str = "sqlite_single",
@@ -78,29 +89,60 @@ def create_repo(
 ) -> Repository:
     """Create a new repository (spec 4.4) and return a ready-to-use Repository.
 
-    Refuses to run over an existing repository; ``profiles`` is required
-    (validated via :func:`validate_profiles`).
+    All-or-nothing (locked decision D5/H3): the repository is built in a
+    sibling temp directory (with the initial config committed in the same
+    transaction as the migration) and atomically renamed into place; any
+    failure leaves no ``repo.sqlite`` / ``index.sqlite`` / ``payload/`` and a
+    later create/open behaves as on a fresh path. ``~/...`` is expanded
+    (D11/M24). The exists-check (D11/H5) runs BEFORE profile validation.
+
+    ``shard_min_bytes`` is the allowed floor for ``shard_cap_bytes`` (must be
+    a positive int, ``min <= cap``); routing uses only ``shard_cap_bytes``
+    (locked decision D4).
     """
-    profiles = validate_profiles(profiles)
-    identity = identity or IKB1
-    root = Path(path)
-    if (root / "index.sqlite").exists() or (root / "repo.sqlite").exists():
+    root = Path(path).expanduser().resolve()
+    if _repo_markers_exist(root):
         raise InkpackError(f"repository already exists at {root}")
-    backend = SqliteBackend.create(
-        path=path,
-        mode=backend_mode,
-        pragmas=pragmas,
-        shard_cap_bytes=shard_cap_bytes,
-        shard_min_bytes=shard_min_bytes,
-        clock=clock,
-    )
-    backend.config_set("identity_policy", identity.name)
-    backend.config_set("backend_mode", backend_mode)
-    backend.config_set("profiles", profiles_to_config(profiles))
-    backend.config_set("verify_on_read", bool(verify_on_read))
+    if root.exists() and not root.is_dir():
+        raise InkpackError(f"cannot create repository at {root}: path exists and is not a directory")
+    if root.exists() and any(root.iterdir()):
+        raise InkpackError(f"cannot create repository at {root}: directory exists and is not empty")
+    profiles = validate_profiles(profiles)  # after the exists-check (D11/M24)
+    identity = identity or IKB1
+    initial_config: dict[str, Any] = {
+        "identity_policy": identity.name,
+        "backend_mode": backend_mode,
+        "profiles": profiles_to_config(profiles),
+        "verify_on_read": bool(verify_on_read),
+    }
     if backend_mode == "sqlite_sharded":
-        backend.config_set("shard_cap_bytes", int(shard_cap_bytes))
-        backend.config_set("shard_min_bytes", int(shard_min_bytes))
+        initial_config["shard_cap_bytes"] = int(shard_cap_bytes)
+        initial_config["shard_min_bytes"] = int(shard_min_bytes)
+    tmp = root.parent / f".inkpack-creating-{uuid.uuid4().hex}"
+    try:
+        # Create-phase failures propagate raw (D5/H3): the temp dir is removed
+        # and the destination is untouched, so a retry behaves as fresh.
+        backend = SqliteBackend.create(
+            path=tmp,
+            mode=backend_mode,
+            pragmas=pragmas,
+            shard_cap_bytes=shard_cap_bytes,
+            shard_min_bytes=shard_min_bytes,
+            clock=clock,
+            initial_config=initial_config,
+        )
+    except BaseException:
+        shutil.rmtree(tmp, ignore_errors=True)
+        raise
+    try:
+        os.replace(tmp, root)  # atomic; root absent or an empty dir
+        backend.root = root
+        backend.index_path = root / ("index.sqlite" if backend_mode == "sqlite_sharded" else "repo.sqlite")
+        if backend.payload_dir is not None:
+            backend.payload_dir = root / "payload"
+    except OSError as exc:
+        shutil.rmtree(tmp, ignore_errors=True)
+        raise InkpackError(f"cannot create repository at {root}: {exc}") from exc
     return _build_repository(backend, identity=identity, codec=codec)
 
 
@@ -112,15 +154,18 @@ def open_repo(
     codec: CodecEngine | None = None,
     clock: Clock | None = None,
 ) -> Repository:
-    """Open an existing repository, validating its stored config.
+    """Open an existing repository, validating its stored config (D8/M12).
 
     Layout detection happens here, not in SQL: ``index.sqlite`` + ``payload/``
     implies ``sqlite_sharded``, ``repo.sqlite`` implies ``sqlite_single``,
-    both raise (ambiguous), neither raises :class:`NotFound`. Stored
-    ``identity_policy``, ``backend_mode`` and profiles are validated
-    (decisions I; review §1, §9).
+    both raise (ambiguous), neither raises :class:`NotFound`. A broken layout
+    (``index.sqlite`` without ``payload/``) is ``InkpackError``, never
+    ``NotFound`` (M13). ``~/...`` is expanded (D11/M24). Every config value is
+    validated strictly at open time; shard caps are restored from config.
     """
-    root = Path(path)
+    root = Path(path).expanduser().resolve()
+    if root.exists() and not root.is_dir():
+        raise InkpackError(f"cannot open repository at {root}: path exists and is not a directory")
     has_index = (root / "index.sqlite").exists()
     has_single = (root / "repo.sqlite").exists()
     if has_index and has_single:
@@ -131,8 +176,16 @@ def open_repo(
         mode = "sqlite_single"
     else:
         raise NotFound(f"no inkpack repository found at {root}")
-    backend = SqliteBackend.open(path=path, mode=mode, pragmas=pragmas, clock=clock)
+    backend = SqliteBackend.open(path=root, mode=mode, pragmas=pragmas, clock=clock)
+    _load_repo_config(backend, root, mode, identity)
+    return _build_repository(backend, identity=identity or IKB1, codec=codec)
 
+
+def _load_repo_config(
+    backend: SqliteBackend, root: Path, mode: str, identity: Identity | None
+) -> dict[str, Any]:
+    """Validate the stored repo config strictly at open time (locked decision
+    D8 / review M12)."""
     identity_policy = backend.config_get("identity_policy")
     if identity_policy is None:
         raise InkpackError(f"{root} is not an inkpack repository (repo_config.identity_policy missing)")
@@ -142,7 +195,10 @@ def open_repo(
     elif identity_policy != "ikb1":
         raise InkpackError(f"unsupported identity_policy: {identity_policy!r} (expected 'ikb1')")
 
-    stored_profiles = profiles_from_config(backend.config_get("profiles"))
+    profiles_raw = backend.config_get("profiles")
+    if profiles_raw is None:
+        raise InkpackError(f"invalid repo config: profiles missing at {root}")
+    stored_profiles = profiles_from_config(profiles_raw)
     if not stored_profiles:
         raise InkpackError("invalid repo config: profiles missing or empty")
     try:
@@ -154,15 +210,36 @@ def open_repo(
     if configured_mode != mode:
         raise InkpackError(f"backend_mode mismatch: config says {configured_mode!r}, layout implies {mode!r}")
 
-    if backend.mode == "sqlite_sharded":
-        cap = backend.config_get("shard_cap_bytes")
-        minimum = backend.config_get("shard_min_bytes")
-        if isinstance(cap, int) and cap > 0:
-            backend.shard_cap_bytes = cap
-        if isinstance(minimum, int) and minimum > 0:
-            backend.shard_min_bytes = minimum
+    verify_on_read = backend.config_get("verify_on_read")
+    if verify_on_read is None:
+        verify_on_read = False
+    if not isinstance(verify_on_read, bool):
+        raise InkpackError(
+            f"invalid repo config: verify_on_read must be a bool, got {verify_on_read!r}"
+        )
 
-    return _build_repository(backend, identity=identity, codec=codec)
+    cap = backend.config_get("shard_cap_bytes")
+    minimum = backend.config_get("shard_min_bytes")
+    if backend.mode == "sqlite_sharded":
+        if cap is not None:
+            if isinstance(cap, bool) or not isinstance(cap, int) or cap <= 0:
+                raise InkpackError(f"invalid repo config: shard_cap_bytes must be a positive int, got {cap!r}")
+            backend.shard_cap_bytes = cap
+        if minimum is not None:
+            if isinstance(minimum, bool) or not isinstance(minimum, int) or minimum <= 0:
+                raise InkpackError(f"invalid repo config: shard_min_bytes must be a positive int, got {minimum!r}")
+            backend.shard_min_bytes = minimum
+        if backend.shard_min_bytes > backend.shard_cap_bytes:
+            raise InkpackError(
+                f"invalid repo config: shard_min_bytes ({backend.shard_min_bytes}) exceeds "
+                f"shard_cap_bytes ({backend.shard_cap_bytes})"
+            )
+    return {
+        "identity_policy": identity_policy,
+        "backend_mode": configured_mode,
+        "profiles": stored_profiles,
+        "verify_on_read": verify_on_read,
+    }
 
 
 __all__ = [
@@ -170,6 +247,7 @@ __all__ = [
     "Busy",
     "Cancelled",
     "ChapterInfo",
+    "Clock",
     "CompactResult",
     "ContentRef",
     "CorruptContent",

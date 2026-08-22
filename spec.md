@@ -1621,3 +1621,72 @@ paths map busy/locked to `Busy` too.
 **S9 — `list_shards()` (spec §8 operational).** Only files matching
 `shard-<digits>.sqlite` count; all other filenames are ignored so stray files
 cannot crash open/validation/compact.
+
+## M) Locked decisions (D1–D12)
+
+**D1 — Snapshot reads.** Readers may overlap a writer, but a read of
+encodings + payload MUST be one snapshot: `get_bytes`/`verify`/`reencode`
+decode inside a transaction that reads both (single: `BEGIN` on the index
+connection; sharded: `ATTACH` the shard to the SAME index connection, never a
+second shard connection). Maintenance writers (`put*`, `upsert*`, `reencode`,
+`gc`, `compact`, `train_dict`) are exclusive with each other (`Busy`).
+
+**D2 — Canonical shard names.** The canonical name is `shard-{id:04d}.sqlite`
+(ids ≥ 10000 naturally become 5+ digits). `list_shards()` returns an id ONLY
+when the observed filename equals that name; non-canonical `shard-<digits>`
+names or two files with the same numeric id → `InkpackError` on open with a
+rename hint. Names not matching `shard-<digits>.sqlite` are ignored (S9).
+
+**D3 — Put commit point.** `put_*` is a writer. A dedupe hit is committed
+inside a write transaction that re-probes payload + required dict; success
+means readable at commit. Later `gc` may still delete it.
+
+**D4 — `shard_min_bytes`.** Stays in the public signature and is persisted,
+but is ONLY a validation floor (positive non-bool int, `min ≤ cap`). Routing
+uses only `shard_cap_bytes`.
+
+**D5 — All-or-nothing create.** `create_repo` builds in a sibling temp
+directory (initial `repo_config` committed in the same transaction as the
+migration) and atomically renames into place; any failure leaves no
+`repo.sqlite` / `index.sqlite` / `payload/` and a retry behaves as on a fresh
+path. Create-phase failures propagate raw; rename-phase failures are
+`InkpackError`.
+
+**D6 — Stream identity.** `key_tuple` is not public. Stream puts look up by
+digest first (no spool read on hit); a miss/repair reads the spool and
+re-binds with `identity.key_bytes(raw)` (forged digests refused). Correctness
+over skipping a hash.
+
+**D7 — Stored metadata is authoritative.** Stored encoding metadata that is
+not a usable policy (unparsable/non-object `codec_params_json`, `codec
+'none'` with a dict id, engine-rejected params) is `CorruptContent`, not
+`ValueError` and not a silent default. Caller-supplied policy (new profile,
+ad-hoc reencode options) stays `ValueError` at the call boundary.
+
+**D8 — Strict open-time config.** `open_repo` validates `identity_policy`,
+`backend_mode`, profiles (missing → `InkpackError("…profiles missing…")`),
+`verify_on_read` (`bool` or missing → `False`), and shard ints (`int` not
+`bool`, `min ≤ cap`). A broken layout (`index.sqlite` without `payload/`) is
+`InkpackError`, never `NotFound`.
+
+**D9 — Typed errors.** No raw `json.JSONDecodeError` / `sqlite3.Error` out of
+public or factory paths. Busy/locked → `Busy` (including open/migrate/
+validation). Missing file at ATTACH → `MissingContent`. Present-but-unreadable
+→ `CorruptContent`. Everything else → `InkpackError`. `txn_on` rollback
+errors are suppressed so they cannot mask the original.
+
+**D10 — Operation abandonment.** A consumer exception closes the generator
+and `.result` re-raises that exception when observable (on CPython, the
+for-loop delivers `GeneratorExit` into a generator-method `__iter__` during
+the unwind, so `.result` surfaces the deterministic abandonment state —
+`Cancelled`). `close()` / `with` / never-started abandon → `Cancelled`.
+Never-started writer `close()` emits `warnings.warn`. No eager-run on
+construction.
+
+**D11 — Paths.** `~/…` is expanded (`Path.expanduser().resolve()`) in both
+factories. The exists-check (markers or `payload/shard-*.sqlite`) runs BEFORE
+`validate_profiles`.
+
+**D12 — Delete is catalog-only.** No `delete(..., reclaim=True)`; the
+two-step `delete_chapter` + `gc(iter_live_content())` is spec-locked and
+documented in the README.

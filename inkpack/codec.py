@@ -23,7 +23,10 @@ CHUNK_SIZE = 128 * 1024
 # Strict ASCII-canonical ikb1 key format (locked semantics S4): ASCII digits
 # only, lowercase hex, exact lengths. Unicode digits, uppercase hex, other
 # prefixes and malformed lengths are all rejected.
-_IKB1_RE = re.compile(r"^ikb1:[0-9]+:[0-9a-f]{64}:[0-9a-f]{32}$")
+# Strict ASCII-canonical ikb1 key format (locked semantics S4 + review M17):
+# ASCII digits only (no leading zeros), lowercase hex, exact lengths, and a
+# hard end anchor so a trailing newline is rejected.
+_IKB1_RE = re.compile(r"^ikb1:(0|[1-9][0-9]*):[0-9a-f]{64}:[0-9a-f]{32}\Z")
 
 
 def canonical_json(obj: Any) -> str:
@@ -150,7 +153,7 @@ class IKB1Identity:
         ``ikb1:<ascii-digits>:<64 lowercase hex>:<32 lowercase hex>`` shape is
         accepted.
         """
-        if not _IKB1_RE.match(blob_key):
+        if not _IKB1_RE.fullmatch(blob_key):
             raise ValueError(f"invalid blob_key: {blob_key!r}")
         _, raw_len_s, sha, blake = blob_key.split(":")
         return int(raw_len_s), sha, blake
@@ -277,7 +280,10 @@ class CodecEngine:
         dict_bytes: bytes | None,
         max_output_size: int | None = None,
     ) -> bytes:
-        del codec_params_json  # kept in the contract; zstd decoding needs no params
+        # codec_params_json is intentionally ignored for decode: 'none' and
+        # zstd store everything needed in the frame; params only shape writes
+        # (review L27).
+        del codec_params_json
         if codec == "none":
             # Locked semantics S3: codec 'none' stores the raw bytes, so the
             # stored length must equal the blob_key's declared raw_len.

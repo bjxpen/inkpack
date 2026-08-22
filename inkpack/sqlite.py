@@ -32,6 +32,7 @@ from .types import (
     MissingContent,
     NotFound,
     check_cancel,
+    profiles_from_config,
 )
 
 LATEST_USER_VERSION = 1
@@ -225,9 +226,16 @@ def connect_file(
     paths pass ``create=True`` (``mode=rwc``).
     """
     mode = "rwc" if create else "rw"
-    conn = sqlite3.connect(
-        sqlite_uri(db_path, mode), uri=True, timeout=max(busy_timeout_ms / 1000.0, 0.001)
-    )
+    try:
+        conn = sqlite3.connect(
+            sqlite_uri(db_path, mode), uri=True, timeout=max(busy_timeout_ms / 1000.0, 0.001)
+        )
+    except sqlite3.Error as exc:
+        if _is_busy(exc):
+            raise Busy(str(exc)) from exc
+        # Missing files (mode=rw) surface as "unable to open database file";
+        # callers classify that message (e.g. Session._shard_conn -> missing).
+        raise InkpackError(f"cannot open database {db_path}: {exc}") from exc
     conn.row_factory = sqlite3.Row
     # Autocommit mode: reads never leave an implicit open transaction, so a
     # later explicit BEGIN IMMEDIATE on the same connection is always legal.
@@ -252,6 +260,29 @@ def _is_busy(exc: sqlite3.Error) -> bool:
     return "locked" in message or "busy" in message
 
 
+def loads_config(text: str, *, key: str) -> Any:
+    """Parse a repo_config/meta JSON value; corrupt JSON is InkpackError, never
+    a raw json.JSONDecodeError (locked decision D9)."""
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise InkpackError(f"invalid repo config JSON for {key}: {exc}") from exc
+
+
+def shard_filename(shard_id: int) -> str:
+    """Canonical shard filename (locked decision D2): zero-padded 4 digits;
+    ids >= 10000 naturally grow to 5+ digits."""
+    return f"shard-{shard_id:04d}.sqlite"
+
+
+def _require_pk(value: Any, label: str) -> int:
+    """Validate a primary-key argument (locked decision M16): int, not bool,
+    non-negative."""
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise TypeError(f"{label} must be a non-negative int, got {type(value).__name__}")
+    return value
+
+
 def _require_positive_int(value: Any, label: str) -> int:
     """Runtime validation of caller-supplied integers (config values)."""
     if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
@@ -268,22 +299,33 @@ def _require_scope(scope: Any) -> int | None:
     return scope
 
 
-def _map_busy(exc: sqlite3.OperationalError) -> None:
+def _map_busy(exc: sqlite3.Error) -> None:
     """Translate a sqlite busy/locked error into :class:`Busy` (locked
     semantics S8: open/migrate/validation paths must not leak raw errors)."""
     if _is_busy(exc):
         raise Busy(str(exc)) from exc
 
 
+def _split_statements(script: str) -> list[str]:
+    return [stmt.strip() for stmt in script.split(";") if stmt.strip()]
+
+
 def migrate_index(conn: sqlite3.Connection) -> None:
+    """Run index migrations as individual statements inside ONE explicit
+    transaction (review L27: ``executescript`` would implicitly COMMIT)."""
     try:
+        conn.execute("BEGIN")
         current = int(conn.execute("PRAGMA user_version").fetchone()[0])
         for version, script in MIGRATIONS:
             if version <= current:
                 continue
-            conn.executescript(script)
+            for stmt in _split_statements(script):
+                conn.execute(stmt)
             conn.execute(f"PRAGMA user_version={version}")
+        conn.commit()
     except sqlite3.OperationalError as exc:
+        with suppress(sqlite3.Error):
+            conn.rollback()
         _map_busy(exc)
         raise
 
@@ -295,20 +337,60 @@ def _payload_version(conn: sqlite3.Connection) -> int:
 
 
 def migrate_payload(conn: sqlite3.Connection) -> None:
+    """Run payload migrations inside ONE explicit transaction (idempotent)."""
     try:
+        conn.execute("BEGIN")
+        conn.execute(_PAYLOAD_VERSION_TABLE)
         current = _payload_version(conn)
         for version, script in PAYLOAD_MIGRATIONS:
             if version <= current:
                 continue
-            conn.executescript(script)
+            for stmt in _split_statements(script):
+                conn.execute(stmt)
             conn.execute(
                 "INSERT INTO _inkpack_schema(key, version) VALUES('payload', ?) "
                 "ON CONFLICT(key) DO UPDATE SET version=excluded.version",
                 (version,),
             )
+        conn.commit()
     except sqlite3.OperationalError as exc:
+        with suppress(sqlite3.Error):
+            conn.rollback()
         _map_busy(exc)
         raise
+
+
+def migrate_payload_attached(conn: sqlite3.Connection) -> None:
+    """Migrate the payload schema of a shard ATTACHed as ``p`` (review M10).
+
+    Runs inside the caller's transaction; the version table lives in the
+    shard (``p._inkpack_schema``), so each shard tracks its own payload
+    schema version independently of the index.
+    """
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS p._inkpack_schema(key TEXT PRIMARY KEY, version INTEGER NOT NULL)"
+    )
+    row = conn.execute("SELECT version FROM p._inkpack_schema WHERE key='payload'").fetchone()
+    current = int(row[0]) if row is not None else 0
+    for version, script in PAYLOAD_MIGRATIONS:
+        if version <= current:
+            continue
+        for stmt in _split_statements(script):
+            conn.execute(stmt.replace("payload", "p.payload", 1))
+        conn.execute(
+            "INSERT INTO p._inkpack_schema(key, version) VALUES('payload', ?) "
+            "ON CONFLICT(key) DO UPDATE SET version=excluded.version",
+            (version,),
+        )
+
+
+def _write_initial_config(conn: sqlite3.Connection, config: dict[str, Any]) -> None:
+    """Write the initial repo_config rows in the caller's transaction (H3)."""
+    for key, obj in config.items():
+        conn.execute(
+            "INSERT INTO repo_config(key, value_json) VALUES(?, ?)",
+            (key, canonical_json(obj)),
+        )
 
 
 def _ensure_shard_file(payload_dir: Path, shard_id: int, busy_timeout_ms: int, synchronous: str) -> Path:
@@ -376,7 +458,7 @@ class Session:
 
     def config(self, key: str) -> Any:
         row = self.query_one("SELECT value_json FROM repo_config WHERE key=?", (key,))
-        return None if row is None else json.loads(str(row[0]))
+        return None if row is None else loads_config(str(row[0]), key=key)
 
     def _shard_conn(self, shard_id: int) -> sqlite3.Connection | None:
         """Open (and cache) a shard connection; returns None when the shard
@@ -403,6 +485,18 @@ class Session:
                 return None
             if _is_busy(exc):
                 raise Busy(str(exc)) from exc
+            raise CorruptContent(f"shard {shard_id} is present but unusable: {exc}") from exc
+        except InkpackError as exc:
+            message = str(exc).lower()
+            if "unable to open database file" in message:
+                self._missing_shards.add(shard_id)  # negative cache
+                return None
+            raise CorruptContent(f"shard {shard_id} is present but unusable: {exc}") from exc
+        try:
+            migrate_payload(conn)  # idempotent; keeps existing shards current (M10)
+        except sqlite3.Error as exc:
+            conn.close()
+            _map_busy(exc)
             raise CorruptContent(f"shard {shard_id} is present but unusable: {exc}") from exc
         self._shard_conns[shard_id] = conn
         return conn
@@ -456,6 +550,10 @@ class Session:
             self._dict_cache[dict_id] = None if row is None else bytes(row[0])
         return self._dict_cache[dict_id]
 
+    def forget_missing_shard(self, shard_id: int) -> None:
+        """Drop a negative-cache entry after the shard file was (re)created."""
+        self._missing_shards.discard(shard_id)
+
     def close(self) -> None:
         if self._closed:
             return
@@ -499,9 +597,22 @@ class SqliteBackend:
         shard_cap_bytes: int = 2 << 30,
         shard_min_bytes: int = 256 << 20,
         clock: Clock | None = None,
+        initial_config: dict[str, Any] | None = None,
     ) -> SqliteBackend:
-        """Create a brand-new repository database (never opens existing files)."""
-        return cls.open(
+        """Create a brand-new repository database.
+
+        Refuses an existing repository (review H5): index/repo markers OR any
+        ``payload/shard-*.sqlite`` file (canonical or not) means the path is
+        already a repository. ``initial_config`` rows are written in the same
+        transaction as the migration (review H3) so creation is all-or-nothing.
+        """
+        root = Path(path)
+        payload_dir = root / "payload"
+        markers_exist = (root / "index.sqlite").exists() or (root / "repo.sqlite").exists()
+        shards_exist = payload_dir.is_dir() and any(payload_dir.glob("shard-*.sqlite"))
+        if markers_exist or shards_exist:
+            raise InkpackError(f"repository already exists at {root}")
+        backend = cls.open(
             path,
             mode,
             pragmas=pragmas,
@@ -509,7 +620,9 @@ class SqliteBackend:
             shard_min_bytes=shard_min_bytes,
             clock=clock,
             create=True,
+            initial_config=initial_config,
         )
+        return backend
 
     @classmethod
     def open(
@@ -522,13 +635,16 @@ class SqliteBackend:
         clock: Clock | None = None,
         *,
         create: bool = False,
+        initial_config: dict[str, Any] | None = None,
     ) -> SqliteBackend:
         """Open an existing repository, or create one when ``create=True``.
 
         With ``create=False`` (the default) a missing repository raises
         :class:`NotFound` and **no files or directories are created** (review
         P0-2). With ``create=True`` an existing repository is refused (review
-        P0-6); ``create`` never opens/migrates an existing DB.
+        P0-6, H5); ``create`` never opens/migrates an existing DB, and
+        ``initial_config`` rows are committed in the same transaction as the
+        migration (review H3).
         """
         if mode not in ("sqlite_single", "sqlite_sharded"):
             raise ValueError(f"mode must be 'sqlite_single' or 'sqlite_sharded', got {mode!r}")
@@ -559,10 +675,16 @@ class SqliteBackend:
             )
             try:
                 if create:
-                    conn.execute("PRAGMA journal_mode=WAL")
-                    conn.execute("PRAGMA auto_vacuum=NONE")
+                    try:
+                        conn.execute("PRAGMA journal_mode=WAL")
+                        conn.execute("PRAGMA auto_vacuum=NONE")
+                    except sqlite3.OperationalError as exc:
+                        _map_busy(exc)
+                        raise
                 migrate_index(conn)
                 migrate_payload(conn)
+                if create and initial_config:
+                    _write_initial_config(conn, initial_config)
             finally:
                 conn.close()
         else:
@@ -570,15 +692,21 @@ class SqliteBackend:
             if create:
                 payload_dir.mkdir(parents=True, exist_ok=True)
             elif not payload_dir.is_dir():
-                raise NotFound(f"inkpack repository payload directory missing at {payload_dir}")
+                raise InkpackError(f"broken repository layout at {root}: payload directory missing")
             conn = connect_file(
                 index_path, pragmas["busy_timeout_ms"], pragmas["synchronous"], create=create
             )
             try:
                 if create:
-                    conn.execute("PRAGMA journal_mode=DELETE")
-                    conn.execute("PRAGMA auto_vacuum=NONE")
+                    try:
+                        conn.execute("PRAGMA journal_mode=DELETE")
+                        conn.execute("PRAGMA auto_vacuum=NONE")
+                    except sqlite3.OperationalError as exc:
+                        _map_busy(exc)
+                        raise
                 migrate_index(conn)
+                if create and initial_config:
+                    _write_initial_config(conn, initial_config)
             finally:
                 conn.close()
             if create:
@@ -599,23 +727,49 @@ class SqliteBackend:
         return backend
 
     def _validate_journal_modes(self) -> None:
-        if self.mode != "sqlite_sharded":
+        """Validate journal modes on open and migrate existing shards (M10).
+
+        Single mode allows ``wal``/``delete``/``truncate`` (WAL is the
+        recommended default; tampering is visible, review L27). Sharded mode
+        requires rollback journal on the index and every shard (spec 8.2).
+        Non-canonical shard filenames are refused (locked decision D2/H4).
+        """
+        offenders = self._shard_name_offenders()
+        if offenders:
+            raise InkpackError(
+                "non-canonical shard filenames: "
+                + ", ".join(sorted(offenders))
+                + "; rename e.g. 'shard-1.sqlite' to 'shard-0001.sqlite'"
+            )
+        if self.mode == "sqlite_single":
+            self._check_journal(self.index_path, "index", {"wal", "delete", "truncate"})
             return
-        dbs: list[tuple[str, Path]] = [("index", self.index_path)]
-        dbs.extend((f"shard {sid}", self.shard_path(sid)) for sid in self.list_shards())
-        for label, path in dbs:
-            # sqlite3.Connection's context manager commits/rolls back but does
-            # NOT close: close explicitly (review P0-CLOSE-1).
+        self._check_journal(self.index_path, "index", {"delete", "truncate"})
+        for sid in self.list_shards():
+            path = self.shard_path(sid)
             conn = connect_file(path, self.busy_timeout_ms, self.synchronous)
             try:
+                migrate_payload(conn)  # idempotent; existing shards stay current (M10)
                 journal_mode = str(conn.execute("PRAGMA journal_mode").fetchone()[0]).lower()
             except sqlite3.OperationalError as exc:
                 _map_busy(exc)
-                raise InkpackError(f"{label} DB is not a valid sqlite database: {exc}") from exc
+                raise InkpackError(f"shard {sid} DB is not a valid sqlite database: {exc}") from exc
             finally:
                 conn.close()
             if journal_mode not in {"delete", "truncate"}:
-                raise InkpackError(f"{label} DB must use rollback journal mode, found {journal_mode!r}")
+                raise InkpackError(f"shard {sid} DB must use rollback journal mode, found {journal_mode!r}")
+
+    def _check_journal(self, path: Path, label: str, allowed: set[str]) -> None:
+        conn = connect_file(path, self.busy_timeout_ms, self.synchronous)
+        try:
+            journal_mode = str(conn.execute("PRAGMA journal_mode").fetchone()[0]).lower()
+        except sqlite3.OperationalError as exc:
+            _map_busy(exc)
+            raise InkpackError(f"{label} DB is not a valid sqlite database: {exc}") from exc
+        finally:
+            conn.close()
+        if journal_mode not in allowed:
+            raise InkpackError(f"{label} DB has unsupported journal mode {journal_mode!r}")
 
     # -- connections / transactions ------------------------------------------
 
@@ -657,8 +811,15 @@ class SqliteBackend:
                 assert shard_path is not None
                 try:
                     conn.execute("ATTACH DATABASE ? AS p", (sqlite_uri(shard_path, "rw"),))
-                except sqlite3.OperationalError as exc:
+                    migrate_payload_attached(conn)  # M10: keep attached shards current
+                except sqlite3.Error as exc:
                     _map_busy(exc)
+                    if "unable to open database" in str(exc).lower():
+                        # The file vanished between the exists() check and the
+                        # ATTACH: missing content, never create (review M14).
+                        raise MissingContent(
+                            f"shard {attach_shard_id} missing at {shard_path}"
+                        ) from exc
                     raise CorruptContent(
                         f"shard {attach_shard_id} is present but unusable: {exc}"
                     ) from exc
@@ -667,12 +828,15 @@ class SqliteBackend:
             yield conn
             conn.commit()
         except sqlite3.OperationalError as exc:
-            conn.rollback()
+            with suppress(sqlite3.Error):
+                conn.rollback()
             if _is_busy(exc):
                 raise Busy(str(exc)) from exc
             raise
         except BaseException:
-            conn.rollback()
+            # Rollback errors must not mask the original failure (D9).
+            with suppress(sqlite3.Error):
+                conn.rollback()
             raise
         finally:
             if attached:
@@ -719,7 +883,7 @@ class SqliteBackend:
 
     def config_get(self, key: str) -> Any:
         row = self._query_one("SELECT value_json FROM repo_config WHERE key=?", (key,))
-        return None if row is None else json.loads(str(row[0]))
+        return None if row is None else loads_config(str(row[0]), key=key)
 
     def config_set(self, key: str, obj: Any) -> None:
         with self.txn(write=True) as conn:
@@ -735,7 +899,7 @@ class SqliteBackend:
         update between the read and the write."""
         with self.txn(write=True) as conn:
             row = conn.execute("SELECT value_json FROM repo_config WHERE key=?", (key,)).fetchone()
-            current: Any = None if row is None else json.loads(str(row[0]))
+            current: Any = None if row is None else loads_config(str(row[0]), key=key)
             updated = update(current)
             conn.execute(
                 "INSERT INTO repo_config(key, value_json) VALUES(?, ?) "
@@ -777,16 +941,14 @@ class SqliteBackend:
         The key is the identity: a mismatched stored ``raw_len`` is treated as
         corruption and never silently "repaired".
         """
+        conn.execute(
+            "INSERT OR IGNORE INTO blobs(blob_key, raw_len, created_at) VALUES(?, ?, ?)",
+            (blob_key, raw_len, created_at),
+        )
         row = conn.execute("SELECT raw_len FROM blobs WHERE blob_key=?", (blob_key,)).fetchone()
-        if row is None:
-            conn.execute(
-                "INSERT INTO blobs(blob_key, raw_len, created_at) VALUES(?, ?, ?)",
-                (blob_key, raw_len, created_at),
-            )
-            return
-        if int(row[0]) != raw_len:
+        if row is None or int(row[0]) != raw_len:
             raise CorruptContent(
-                f"blobs.raw_len mismatch for {blob_key}: stored {row[0]}, expected {raw_len}"
+                f"blobs.raw_len mismatch for {blob_key}: stored {row[0] if row else None}, expected {raw_len}"
             )
 
     def store_encoding_and_payload_on(
@@ -890,11 +1052,6 @@ class SqliteBackend:
             ).fetchone()
         return row is not None
 
-    def iter_encodings(self, limit: int | None = None) -> Iterator[sqlite3.Row]:
-        sql = "SELECT * FROM encodings ORDER BY blob_key, profile"
-        rows = self._query_all(sql + " LIMIT ?", (limit,)) if limit is not None else self._query_all(sql)
-        yield from rows
-
     # -- dictionaries ---------------------------------------------------------
 
     def put_dict(self, dict_id: str, codec: str, dict_bytes: bytes, params_json: str | None, created_at: str) -> None:
@@ -942,17 +1099,19 @@ class SqliteBackend:
         return [dict(row) for row in rows]
 
     def get_novel(self, novel_id: int) -> sqlite3.Row | None:
-        return self._query_one("SELECT * FROM novels WHERE id=?", (int(novel_id),))
+        return self._query_one("SELECT * FROM novels WHERE id=?", (_require_pk(novel_id, "novel_id"),))
 
     def list_chapters(self, novel_id: int) -> list[sqlite3.Row]:
         # Catalog ordering by order_key (text sort), id as a stable tiebreak
         # (review P1-7).
         return self._query_all(
-            "SELECT * FROM chapters WHERE novel_id=? ORDER BY order_key, id", (int(novel_id),)
+            "SELECT * FROM chapters WHERE novel_id=? ORDER BY order_key, id",
+            (_require_pk(novel_id, "novel_id"),),
         )
 
     def update_novel(self, novel_id: int, title: str | None = None, slug: str | None = None) -> bool:
         """Update the provided fields; returns False when the novel is missing."""
+        novel_id = _require_pk(novel_id, "novel_id")
         sets: list[str] = []
         params: list[Any] = []
         if title is not None:
@@ -970,8 +1129,9 @@ class SqliteBackend:
 
     def delete_chapter(self, chapter_id: int) -> bool:
         """Delete a chapter row and its metadata; returns False when missing."""
+        chapter_id = _require_pk(chapter_id, "chapter_id")
         with self.txn(write=True) as conn:
-            cur = conn.execute("DELETE FROM chapters WHERE id=?", (int(chapter_id),))
+            cur = conn.execute("DELETE FROM chapters WHERE id=?", (chapter_id,))
             existed = cur.rowcount > 0
             if existed:
                 conn.execute(
@@ -986,6 +1146,7 @@ class SqliteBackend:
         Uses subquery deletes (review P1-DEL-1) so deleting a novel with
         thousands of chapters never exceeds SQLite's variable-number limit.
         """
+        novel_id = _require_pk(novel_id, "novel_id")
         with self.txn(write=True) as conn:
             novel = conn.execute("SELECT 1 FROM novels WHERE id=?", (int(novel_id),)).fetchone()
             if novel is None:
@@ -1007,43 +1168,6 @@ class SqliteBackend:
             )
             conn.execute("DELETE FROM novels WHERE id=?", (int(novel_id),))
         return True
-
-    def upsert_chapter(
-        self,
-        novel_id: int,
-        order_key: str,
-        blob_key: str,
-        profile: str,
-        media_type: str | None,
-        charset: str | None,
-        meta: dict[str, Any] | None = None,
-    ) -> int:
-        """Insert or update the chapter keyed by ``(novel_id, order_key)``.
-
-        Probes the parent novel explicitly so a missing novel is a clear
-        :class:`NotFound` and any *other* integrity error stays an
-        :class:`InkpackError` (review §10).
-        """
-        now = self.now()
-        with self.txn(write=True) as conn:
-            novel = conn.execute("SELECT 1 FROM novels WHERE id=?", (int(novel_id),)).fetchone()
-            if novel is None:
-                raise NotFound(f"novel {novel_id} not found")
-            conn.execute(
-                _UPSERT_CHAPTER,
-                (int(novel_id), order_key, blob_key, profile, media_type, charset, now, now),
-            )
-            row = conn.execute(
-                "SELECT id FROM chapters WHERE novel_id=? AND order_key=?",
-                (int(novel_id), order_key),
-            ).fetchone()
-            if row is None:
-                raise InkpackError("chapter upsert failed to produce an id")
-            chapter_id = int(row[0])
-        if meta:
-            for key, value in meta.items():
-                self.meta_set("chapter", chapter_id, str(key), value)
-        return chapter_id
 
     def upsert_chapter_with_content(
         self,
@@ -1083,12 +1207,7 @@ class SqliteBackend:
         if self.mode == "sqlite_sharded" and enc is not None and (
             shard_id is None or not self.shard_path(shard_id).exists()
         ):
-            # Probe the novel first so a missing novel cannot trigger
-            # shard-file creation (review P1-1 side effects).
-            if self._query_one("SELECT 1 FROM novels WHERE id=?", (int(novel_id),)) is None:
-                raise NotFound(f"novel {novel_id} not found")
-            shard_id = self.choose_shard_for_write(enc.stored_len)
-            self.ensure_shard_exists(shard_id)
+            shard_id = self.resolve_write_shard(enc.stored_len, shard_id)
         attach = shard_id if (self.mode == "sqlite_sharded" and (enc is not None or shard_id is not None)) else None
         try:
             with self.txn(write=True, attach_shard_id=attach) as conn:
@@ -1135,33 +1254,60 @@ class SqliteBackend:
                         raise InkpackError(
                             f"payload for {(blob_key, profile)} missing between prepare and persist; retry"
                         )
-                novel = conn.execute("SELECT 1 FROM novels WHERE id=?", (int(novel_id),)).fetchone()
-                if novel is None:
-                    raise NotFound(f"novel {novel_id} not found")
-                # lastrowid is connection-scoped in sqlite3 (it reflects earlier
-                # INSERTs in this txn), so resolve the id deterministically.
-                conn.execute(
-                    _UPSERT_CHAPTER,
-                    (int(novel_id), order_key, blob_key, profile, media_type, charset, now, now),
+                chapter_id = self.upsert_chapter_catalog_on(
+                    conn,
+                    novel_id=novel_id,
+                    order_key=order_key,
+                    blob_key=blob_key,
+                    profile=profile,
+                    media_type=media_type,
+                    charset=charset,
+                    meta=meta,
+                    now=now,
                 )
-                row = conn.execute(
-                    "SELECT id FROM chapters WHERE novel_id=? AND order_key=?",
-                    (int(novel_id), order_key),
-                ).fetchone()
-                if row is None:
-                    raise InkpackError("chapter upsert failed to produce an id")
-                chapter_id = int(row[0])
-                for key, value in (meta or {}).items():
-                    conn.execute(
-                        _UPSERT_META,
-                        ("chapter", str(chapter_id), str(key), canonical_json(value), now),
-                    )
         except sqlite3.IntegrityError as exc:
             raise InkpackError(f"chapter upsert failed: {exc}") from exc
         return chapter_id
 
+    def upsert_chapter_catalog_on(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        novel_id: int,
+        order_key: str,
+        blob_key: str,
+        profile: str,
+        media_type: str | None,
+        charset: str | None,
+        meta: dict[str, Any] | None,
+        now: str,
+    ) -> int:
+        """Upsert the chapter catalog row + metadata inside an OPEN write
+        transaction (novel probe included). Shared by Repository's atomic
+        content+catalog flow and the low-level backend upsert."""
+        novel = conn.execute("SELECT 1 FROM novels WHERE id=?", (_require_pk(novel_id, "novel_id"),)).fetchone()
+        if novel is None:
+            raise NotFound(f"novel {novel_id} not found")
+        conn.execute(
+            _UPSERT_CHAPTER,
+            (int(novel_id), order_key, blob_key, profile, media_type, charset, now, now),
+        )
+        row = conn.execute(
+            "SELECT id FROM chapters WHERE novel_id=? AND order_key=?",
+            (int(novel_id), order_key),
+        ).fetchone()
+        if row is None:
+            raise InkpackError("chapter upsert failed to produce an id")
+        chapter_id = int(row[0])
+        for key, value in (meta or {}).items():
+            conn.execute(
+                _UPSERT_META,
+                ("chapter", str(chapter_id), str(key), canonical_json(value), now),
+            )
+        return chapter_id
+
     def get_chapter(self, chapter_id: int) -> sqlite3.Row | None:
-        return self._query_one("SELECT * FROM chapters WHERE id=?", (int(chapter_id),))
+        return self._query_one("SELECT * FROM chapters WHERE id=?", (_require_pk(chapter_id, "chapter_id"),))
 
     # -- KV metadata (spec 7.2) ---------------------------------------------
 
@@ -1199,7 +1345,7 @@ class SqliteBackend:
             "SELECT value_json FROM meta WHERE entity_type=? AND entity_id=? AND key=?",
             (entity_type, entity_id, str(key)),
         )
-        return None if row is None else json.loads(str(row[0]))
+        return None if row is None else loads_config(str(row[0]), key=f"meta:{entity_type}:{entity_id}:{key}")
 
     def meta_list(self, entity_type: str, entity_id: int | str) -> dict[str, Any]:
         entity_type, entity_id = self._normalize_entity(entity_type, entity_id)
@@ -1207,7 +1353,7 @@ class SqliteBackend:
             "SELECT key, value_json FROM meta WHERE entity_type=? AND entity_id=?",
             (entity_type, entity_id),
         )
-        return {str(row[0]): json.loads(str(row[1])) for row in rows}
+        return {str(row[0]): loads_config(str(row[1]), key=f"meta:{entity_type}:{entity_id}") for row in rows}
 
     def iter_chapter_refs(self, scope: int | None = None) -> Iterator[ContentRef]:
         """Distinct ``(blob_key, profile)`` pairs referenced by chapters."""
@@ -1343,56 +1489,39 @@ class SqliteBackend:
                 s.execute("DROP TABLE IF EXISTS temp_dead")
         return encodings_deleted, payload_rows_deleted
 
-    def list_dead_encodings(self, live_refs: Iterable[ContentRef]) -> list[tuple[str, str, int | None]]:
-        """Test/debug helper: dead encodings as a Python list.
-
-        The production GC path uses :meth:`gc` (SQL-staged, no materialization).
-        """
-        live = {(r.blob_key, r.profile) for r in live_refs}
-        rows = self._query_all("SELECT blob_key, profile, shard_id FROM encodings")
-        return [
-            (str(row[0]), str(row[1]), row[2])
-            for row in rows
-            if (str(row[0]), str(row[1])) not in live
-        ]
-
     def delete_orphan_blobs(self) -> int:
         return self._execute(
             "DELETE FROM blobs WHERE NOT EXISTS ("
             "SELECT 1 FROM encodings e WHERE e.blob_key = blobs.blob_key)"
         )
 
-    def _profile_dict_refs(self) -> set[str]:
-        """Dictionary ids referenced by the current profile config.
-
-        Dicts referenced by profiles are treated as live by GC (spec §4.1
-        Option B): the documented ``train_dict → set_profile → gc → put``
-        workflow must not lose the dictionary.
-        """
-        raw = self.config_get("profiles")
-        refs: set[str] = set()
-        mapping = cast("dict[str, Any]", raw) if isinstance(raw, dict) else None
-        if mapping is not None:
-            for cfg in mapping.values():
-                cfg_dict = cast("dict[str, Any]", cfg) if isinstance(cfg, dict) else None
-                if cfg_dict is not None:
-                    dict_id = cfg_dict.get("zstd_dict_id")
-                    if isinstance(dict_id, str):
-                        refs.add(dict_id)
-        return refs
-
     def delete_unreferenced_dicts(self) -> int:
         """Delete dicts not referenced by any encoding and not referenced by
-        any profile in ``repo_config`` (review §4.1 Option B)."""
-        profile_refs = self._profile_dict_refs()
-        base = (
-            "DELETE FROM dicts WHERE NOT EXISTS ("
-            "SELECT 1 FROM encodings e WHERE e.zstd_dict_id = dicts.dict_id)"
-        )
-        if not profile_refs:
-            return self._execute(base)
-        placeholders = ",".join("?" * len(profile_refs))
-        return self._execute(base + f" AND dict_id NOT IN ({placeholders})", tuple(sorted(profile_refs)))
+        any profile in ``repo_config`` (spec §4.1 Option B).
+
+        The profiles config is parsed STRICTLY inside the same transaction
+        (review M11): a malformed config aborts GC with ``InkpackError``
+        instead of best-effort treating all dicts as unreferenced.
+        """
+        with self.txn(write=True) as conn:
+            row = conn.execute(
+                "SELECT value_json FROM repo_config WHERE key='profiles'"
+            ).fetchone()
+            profile_refs: set[str] = set()
+            if row is not None:
+                raw = loads_config(str(row[0]), key="profiles")
+                profiles = profiles_from_config(raw)  # strict; InkpackError on junk
+                profile_refs = {
+                    p.zstd_dict_id for p in profiles.values() if p.zstd_dict_id is not None
+                }
+            base = (
+                "DELETE FROM dicts WHERE NOT EXISTS ("
+                "SELECT 1 FROM encodings e WHERE e.zstd_dict_id = dicts.dict_id)"
+            )
+            if profile_refs:
+                placeholders = ",".join("?" * len(profile_refs))
+                base += f" AND dict_id NOT IN ({placeholders})"
+            return int(conn.execute(base, tuple(sorted(profile_refs))).rowcount)
 
     def vacuum_index(self) -> str:
         return self._vacuum(self.index_path)
@@ -1402,12 +1531,14 @@ class SqliteBackend:
 
     def _vacuum(self, path: Path) -> str:
         # VACUUM must run on a connection with no ATTACHed databases (decision H).
+        if not path.exists():
+            raise MissingContent(f"cannot vacuum missing database {path}")
         conn = connect_file(path, self.busy_timeout_ms, self.synchronous)
         try:
             conn.execute("VACUUM")
         except sqlite3.OperationalError as exc:
             _map_busy(exc)
-            raise
+            raise InkpackError(f"vacuum failed for {path}: {exc}") from exc
         finally:
             conn.close()
         return str(path)
@@ -1420,17 +1551,58 @@ class SqliteBackend:
         return self.payload_dir / f"shard-{shard_id:04d}.sqlite"
 
     def list_shards(self) -> list[int]:
-        """Shard ids present on disk (locked semantics S9): only files matching
-        ``shard-<digits>.sqlite`` count; any other filename is ignored so
-        stray files can never crash open/validation/compact."""
+        """Shard ids present on disk (locked decisions S9 + D2).
+
+        Only canonical ``shard-{id:04d}.sqlite`` files count; junk filenames
+        are ignored (S9) and non-canonical ``shard-<digits>.sqlite`` names or
+        duplicate numeric ids are recorded as offenders (D2) so open refuses
+        them with a rename hint.
+        """
         if self.payload_dir is None:
             return []
         shard_ids: list[int] = []
+        seen: dict[int, str] = {}
         for path in sorted(self.payload_dir.glob("shard-*.sqlite")):
             match = _SHARD_FILE_RE.match(path.name)
-            if match is not None:
-                shard_ids.append(int(match.group(1)))
+            if match is None:
+                continue
+            sid = int(match.group(1))
+            if path.name != shard_filename(sid) or sid in seen:
+                continue  # offenders are reported by _shard_name_offenders()
+            seen[sid] = path.name
+            shard_ids.append(sid)
         return shard_ids
+
+    def _shard_name_offenders(self) -> list[str]:
+        """Re-scan the payload dir and return non-canonical shard names."""
+        if self.payload_dir is None:
+            return []
+        offenders: list[str] = []
+        seen: dict[int, str] = {}
+        for path in sorted(self.payload_dir.glob("shard-*.sqlite")):
+            match = _SHARD_FILE_RE.match(path.name)
+            if match is None:
+                continue
+            sid = int(match.group(1))
+            if path.name != shard_filename(sid) or sid in seen:
+                offenders.append(path.name)
+            seen[sid] = path.name
+        return offenders
+
+    def resolve_write_shard(self, stored_len: int, current: int | None) -> int:
+        """Pick the shard a payload write lands in (locked semantics S2/H2).
+
+        Returns ``current`` when it is a usable existing shard; otherwise
+        explicitly chooses AND ensures a writable shard (rehoming) — never
+        leaves creation to ATTACH.
+        """
+        if self.mode != "sqlite_sharded":
+            return 0
+        if current is None or not self.shard_path(current).exists():
+            shard_id = self.choose_shard_for_write(stored_len)
+            self.ensure_shard_exists(shard_id)
+            return shard_id
+        return current
 
     def ensure_shard_exists(self, shard_id: int) -> None:
         if self.payload_dir is None:

@@ -58,10 +58,11 @@ Requires Python ≥ 3.11.
 ## Quickstart
 
 ```python
+from pathlib import Path
 from inkpack import create_repo, Profile
 
 repo = create_repo(
-    path="~/novels",
+    path=Path.home() / "novels",   # or "~/novels" — expanded in the factory
     backend_mode="sqlite_single",            # or "sqlite_sharded"
     profiles={
         "raw":        Profile("raw", "none", {}),
@@ -99,6 +100,7 @@ repo.meta_list("chapter", chapter_id)        # {"words": 4200, ...}
 novel = repo.get_novel(novel_id)             # dict row; NotFound if missing
 repo.update_novel(novel_id, title="…", slug="…")
 chapters = repo.list_chapters(novel_id)      # list[ChapterInfo], no bodies, ordered by order_key
+                                           # (order_key is a TEXT sort: zero-pad, e.g. "001")
 info = repo.get_chapter(chapter_id)          # ChapterInfo
 repo.delete_chapter(chapter_id)              # catalog only; then gc(iter_live_content())
 repo.delete_novel(novel_id, cascade=True)    # catalog only; content reclaimed by gc
@@ -319,9 +321,14 @@ existing `chapter_key` (must be `str | int` — S7; `None`/`bool` raise
 `TypeError`) replaces the chapter body in place (same chapter id;
 the old blob becomes garbage) and commits content + catalog **atomically** —
 a failed upsert (missing novel, busy) leaves no orphan blob. Removals are
-catalog-only: `repo.delete_chapter(id)` / `repo.delete_novel(id, cascade=True)`
+catalog-only (D12): `repo.delete_chapter(id)` / `repo.delete_novel(id, cascade=True)`
 never auto-GC. The two-step pattern is:
-`delete_chapter(id)` → `store.gc(live=repo.iter_live_content())` → `verify()`.
+
+```python
+repo.delete_chapter(chapter_id)
+repo.store.gc(live=repo.iter_live_content()).result   # reclaim the old body
+repo.store.verify().result                             # confirm integrity
+```
 
 ---
 
@@ -340,7 +347,9 @@ DBs). Key invariants:
   writing anything — no partial encodings row, no opaque "string or blob too
   big" errors. Tens of GB applies to library size (many chapters / shards),
   not to one chapter. For codec `none`, the raw length IS the stored length,
-  so the cap applies to canonical bytes too.
+  so the cap applies to canonical bytes too. A stream put that misses (or
+  repairs) still peaks at ~raw + encoded + zstd scratch — the spool avoids
+  re-reading the source, not the materialization of a miss.
 - `blob_key` is `ikb1:<raw_len>:<sha256_hex>:<blake2b-128_hex>` and is unique
   (`blobs` PK; `encodings` PK is `(blob_key, profile)`). Parsing is strict
   ASCII canonical (S4): Unicode digits, uppercase hex and other prefixes are
@@ -407,12 +416,17 @@ open_repo(path, pragmas=None, *, identity=None, codec=None, clock=None) -> Repos
 ```
 
 - **create vs open are distinct operations.** `create_repo` refuses an
-  existing repository (`InkpackError`) and requires a non-empty validated
-  profile set (`profiles=None` or `{}` raises `ValueError`). `open_repo`
-  **never creates files**: it detects the layout from the filesystem
-  (`index.sqlite` + `payload/` → `sqlite_sharded`, `repo.sqlite` →
-  `sqlite_single`), raises `InkpackError` for an ambiguous layout (both
-  present), and raises `NotFound` when no repository exists.
+  existing repository (`InkpackError`; markers OR any `payload/shard-*.sqlite`
+  count as "existing") and requires a non-empty validated profile set
+  (`profiles=None` or `{}` raises `ValueError`). Creation is all-or-nothing
+  (D5): built in a sibling temp dir and atomically renamed into place, so a
+  failed create leaves nothing behind and a retry works. `~/...` is expanded
+  in both factories (D11). `open_repo` **never creates files**: it detects
+  the layout from the filesystem (`index.sqlite` + `payload/` →
+  `sqlite_sharded`, `repo.sqlite` → `sqlite_single`), raises `InkpackError`
+  for an ambiguous or broken layout (both markers, or `index.sqlite` without
+  `payload/`), refuses non-canonical shard filenames (D2), and raises
+  `NotFound` only when no repository exists.
 - `pragmas`: `{"busy_timeout_ms": 5000, "synchronous": "NORMAL"}` (the only
   knobs; unknown keys raise `ValueError`). `synchronous` is applied to
   **every** connection (including VACUUM and shard reads), not just at
@@ -421,14 +435,21 @@ open_repo(path, pragmas=None, *, identity=None, codec=None, clock=None) -> Repos
   and raise `CorruptContent` on mismatch (slower; `verify()` is the default
   full check). Read once per call.
 - `identity` / `codec` / `clock`: dependency-injection hooks (see below).
-- `shard_cap_bytes`/`shard_min_bytes` apply to `sqlite_sharded` only; the
-  cap rolls writes to a fresh shard once the current shard file exceeds it
+- `shard_cap_bytes`/`shard_min_bytes` apply to `sqlite_sharded` only.
+  `shard_min_bytes` is the allowed floor for `shard_cap_bytes` (must be a
+  positive int, `min ≤ cap`); **routing uses only `shard_cap_bytes`** (D4) —
+  writes roll to a fresh shard once the current shard file exceeds the cap
   (the write pointer is the highest shard id, never the lexically-last path).
 - Connection policy: one operation-scoped session per public call — `get_bytes`
-  opens 1 connection (2 sharded), `verify`/`reencode`/`gc` are O(1)-O(shards)
-  connections instead of one per row, and GC's TEMP tables live for the whole
-  operation. `compact()` still VACUUMs on a virgin connection with no attached
-  databases.
+  opens 1 connection, `verify`/`reencode`/`gc` are O(1)-O(shards) connections
+  instead of one per row, and GC's TEMP tables live for the whole operation.
+  `compact()` still VACUUMs on a virgin connection with no attached databases.
+- **Snapshot reads (D1).** Every read of encodings + payload is ONE snapshot:
+  sharded reads `ATTACH` the shard to the index connection inside the read
+  transaction — never a second connection.
+- **Exclusive writers.** Maintenance writers are exclusive with each other
+  (`Busy` on lock); `synchronous=NORMAL` is the default and is not full
+  durability (use `FULL` if you need it).
 
 ### Dependency injection
 

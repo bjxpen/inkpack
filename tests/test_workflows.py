@@ -63,10 +63,10 @@ def test_progress_events_verify_sequence_and_metrics(repo):
     events = list(repo.store.verify())
     assert events[0].kind == "start" and events[-1].kind == "done"
     assert all(isinstance(e, OpEvent) for e in events)
+    # Item events are throttled (M22): only the final exact-count item.
     items = [e for e in events if e.kind == "item"]
-    assert len(items) == 30
-    checked = [e.metrics["checked"] for e in items]
-    assert checked == list(range(1, 31))  # monotonic progress
+    assert len(items) == 1
+    assert items[0].metrics["checked"] == 30
     assert events[-1].metrics["checked"] == 30
     assert events[-1].metrics["ok"] == 30
 
@@ -268,7 +268,8 @@ def test_random_chapter_replacement_and_removal(repo):
     assert len(live) <= len(current)  # shared bodies dedupe
 
     # GC reclaims replaced/removed content but keeps every live chapter.
-    encodings_before = len(list(repo.backend.iter_encodings()))
+    with repo.backend.txn(write=False) as conn:
+        encodings_before = int(conn.execute("SELECT COUNT(*) FROM encodings").fetchone()[0])
     gc = repo.store.gc(live=list(repo.iter_live_content())).result
     assert gc.encodings_deleted == encodings_before - len(live)
     for chapter_id, body in current.items():
@@ -421,7 +422,13 @@ def test_decode_failure_is_corruptcontent_not_raw_zstd(repo):
 
 
 def test_missing_dictionary_is_missingcontent(repo):
-    repo.set_profile(Profile(name="ghost_dict", codec="zstd", params={}, zstd_dict_id="ikd1:nope"))
+    # set_profile itself now refuses a missing dictionary (M24)...
+    with pytest.raises(MissingContent):
+        repo.set_profile(Profile(name="ghost_dict", codec="zstd", params={}, zstd_dict_id="ikd1:nope"))
+    # ...and a raw-injected missing dict still fails at write time.
+    profiles = repo.backend.config_get("profiles")
+    profiles["ghost_dict"] = {"codec": "zstd", "params": {}, "zstd_dict_id": "ikd1:nope"}
+    repo.backend.config_set("profiles", profiles)
     with pytest.raises(MissingContent) as exc:
         repo.store.put_bytes(b"x" * 100, profile="ghost_dict").result
     assert "dictionary" in str(exc.value)
