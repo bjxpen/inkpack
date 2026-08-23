@@ -157,17 +157,26 @@ def create_repo(
             stacklevel=2,
         )
         min_shard_cap_bytes = shard_min_bytes
-    if min_shard_cap_bytes is None:
-        min_shard_cap_bytes = DEFAULT_SHARD_MIN_BYTES
+    min_omitted = min_shard_cap_bytes is None
     if backend_mode == "sqlite_sharded":
         # A9: validate the caps at the factory boundary — bool caps
         # (``int(True) == 1``) fail fast here, before initial_config is built
         # or any SQLite work happens. Single mode stays unvalidated (locked,
         # Issue 16).
         shard_cap_bytes = _require_positive_int(shard_cap_bytes, "shard_cap_bytes")
-        min_shard_cap_bytes = _require_positive_int(min_shard_cap_bytes, "min_shard_cap_bytes")
-        if min_shard_cap_bytes > shard_cap_bytes:
-            raise ValueError("min_shard_cap_bytes must not exceed shard_cap_bytes")
+        if min_omitted:
+            # P1.9: an omitted min must not make a small cap uncreatable —
+            # derive min(DEFAULT_SHARD_MIN_BYTES, cap). An EXPLICIT min
+            # (including the deprecated kwarg) bypasses derivation; an
+            # explicit min > cap still raises.
+            min_shard_cap_bytes = min(DEFAULT_SHARD_MIN_BYTES, shard_cap_bytes)
+        else:
+            min_shard_cap_bytes = _require_positive_int(min_shard_cap_bytes, "min_shard_cap_bytes")
+            if min_shard_cap_bytes > shard_cap_bytes:
+                raise ValueError("min_shard_cap_bytes must not exceed shard_cap_bytes")
+    else:
+        if min_shard_cap_bytes is None:
+            min_shard_cap_bytes = DEFAULT_SHARD_MIN_BYTES
     initial_config: dict[str, Any] = {
         "identity_policy": identity.name,
         "backend_mode": backend_mode,

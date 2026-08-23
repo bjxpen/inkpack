@@ -582,6 +582,24 @@ match the stored `identity_policy` when the repo is reopened.
 
 ---
 
+## Changelog
+
+- **`upsert_chapter`/`upsert_chapter_stream` hints (behavior change).**
+  `hints=None` (the default) now **preserves** the chapter's stored
+  `media_type`/`charset` on a re-upsert instead of NULLing them; a provided
+  `hints` dict **replaces the hints group** (present keys written, an omitted
+  key means NULL — `{}` clears both). `meta` was already merged per key and
+  is unchanged. If you relied on re-upserting with default hints to clear
+  the hints, pass `hints={}` explicitly.
+- **`create_repo` sharded caps (behavior change).** Omitting
+  `min_shard_cap_bytes` now derives `min(DEFAULT_SHARD_MIN_BYTES,
+  shard_cap_bytes)` instead of defaulting to 256 MiB — so a small
+  `shard_cap_bytes` is creatable without also passing a min. An explicit min
+  is validated as before (`min > cap` still raises).
+- **Recovery runbook** added (GUARANTEES.md): junk-shard open refusal,
+  corrupt current-write shard, maintenance vs a junk shard,
+  `synchronous=NORMAL`.
+
 ## Development
 
 ```bash

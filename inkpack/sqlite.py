@@ -157,18 +157,6 @@ ON CONFLICT(blob_key, profile) DO UPDATE SET
   updated_at=excluded.updated_at
 """
 
-_UPSERT_CHAPTER = """
-INSERT INTO chapters(
-  novel_id, order_key, blob_key, profile, media_type, charset, created_at, updated_at
-) VALUES(?, ?, ?, ?, ?, ?, ?, ?)
-ON CONFLICT(novel_id, order_key) DO UPDATE SET
-  blob_key=excluded.blob_key,
-  profile=excluded.profile,
-  media_type=excluded.media_type,
-  charset=excluded.charset,
-  updated_at=excluded.updated_at
-"""
-
 _UPSERT_META = """
 INSERT INTO meta(entity_type, entity_id, key, value_json, updated_at) VALUES(?, ?, ?, ?, ?)
 ON CONFLICT(entity_type, entity_id, key) DO UPDATE SET
@@ -1388,21 +1376,62 @@ class SqliteBackend:
         order_key: str,
         blob_key: str,
         profile: str,
-        media_type: str | None,
-        charset: str | None,
+        hints: dict[str, Any] | None,
         meta: dict[str, Any] | None,
         now: str,
     ) -> int:
         """Upsert the chapter catalog row + metadata inside an OPEN write
         transaction (novel probe included). Shared by Repository's atomic
-        content+catalog flow and the low-level backend upsert."""
+        content+catalog flow.
+
+        Hints semantics (r4-P1.8): ``hints is None`` -> the stored
+        ``media_type``/``charset`` are PRESERVED (a re-upsert with default
+        hints does not NULL them out). ``hints`` provided -> the hints group
+        is REPLACED: present keys are written, an omitted key means NULL
+        (``{}`` clears both). ``meta`` always merges per key (independent
+        upserts). New rows get NULLs for omitted/absent hints either way.
+        """
         novel = conn.execute("SELECT 1 FROM novels WHERE id=?", (_require_pk(novel_id, "novel_id"),)).fetchone()
         if novel is None:
             raise NotFound(f"novel {novel_id} not found")
-        conn.execute(
-            _UPSERT_CHAPTER,
-            (int(novel_id), order_key, blob_key, profile, media_type, charset, now, now),
-        )
+        if hints is None:
+            # Preserve the stored hints group on conflict (no magic NULLs):
+            # media_type/charset are NULL literals for NEW rows and simply
+            # absent from the DO UPDATE SET for EXISTING rows.
+            sql = (
+                "INSERT INTO chapters("
+                " novel_id, order_key, blob_key, profile, media_type, charset, created_at, updated_at"
+                ") VALUES(?, ?, ?, ?, NULL, NULL, ?, ?) "
+                "ON CONFLICT(novel_id, order_key) DO UPDATE SET "
+                "blob_key=excluded.blob_key, "
+                "profile=excluded.profile, "
+                "updated_at=excluded.updated_at"
+            )
+            params: tuple[Any, ...] = (int(novel_id), order_key, blob_key, profile, now, now)
+        else:
+            # Replace the hints group: present keys written, omitted -> NULL.
+            sql = (
+                "INSERT INTO chapters("
+                " novel_id, order_key, blob_key, profile, media_type, charset, created_at, updated_at"
+                ") VALUES(?, ?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(novel_id, order_key) DO UPDATE SET "
+                "blob_key=excluded.blob_key, "
+                "profile=excluded.profile, "
+                "media_type=excluded.media_type, "
+                "charset=excluded.charset, "
+                "updated_at=excluded.updated_at"
+            )
+            params = (
+                int(novel_id),
+                order_key,
+                blob_key,
+                profile,
+                hints.get("media_type"),
+                hints.get("charset"),
+                now,
+                now,
+            )
+        conn.execute(sql, params)
         row = conn.execute(
             "SELECT id FROM chapters WHERE novel_id=? AND order_key=?",
             (int(novel_id), order_key),

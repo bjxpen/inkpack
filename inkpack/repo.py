@@ -245,10 +245,16 @@ class Repository:
         sort** (``"1" < "10" < "2"``) — zero-pad for numeric order (e.g.
         ``"001"``). For multi-MB bodies prefer
         :meth:`upsert_chapter_stream` (cancel + live progress).
+
+        ``hints`` (r4-P1.8): ``None`` (the default) **preserves** the
+        chapter's stored ``media_type``/``charset``; a provided dict
+        **replaces the hints group** — present keys are written, an omitted
+        key means NULL (``{}`` clears both). ``meta`` always **merges per
+        key** (each key is an independent upsert; passing a dict never
+        clears keys you don't mention).
         """
         novel_id = self._require_novel_id(novel_id)
         order_key = self._normalize_chapter_key(chapter_key)
-        hints = hints or {}
         with self.backend.session() as s:
             if s.query_one("SELECT 1 FROM novels WHERE id=?", (novel_id,)) is None:
                 raise NotFound(f"novel {novel_id} not found")
@@ -274,11 +280,13 @@ class Repository:
         ``chapter_key`` becomes ``order_key`` (TEXT sort — zero-pad for
         numeric order). The preferred form for multi-MB bodies: cancel +
         live progress, and the source is read in one pass.
+
+        ``hints``/``meta`` semantics are identical to :meth:`upsert_chapter`
+        (hints preserve-or-replace; meta merges per key).
         """
         del size_hint
         novel_id = self._require_novel_id(novel_id)
         order_key = self._normalize_chapter_key(chapter_key)
-        hints = hints or {}
         _require_binary_stream(fp, "upsert_chapter_stream")  # A8
 
         def _run() -> Generator[OpEvent, None, int]:
@@ -324,20 +332,23 @@ class Repository:
         novel_id: int,
         order_key: str,
         prepared: PreparedPut,
-        hints: dict[str, Any],
+        hints: dict[str, Any] | None,
         meta: dict[str, Any] | None,
         now: str,
     ) -> int:
         """Write the chapter catalog + metadata inside the caller's open
-        write transaction, then fire the pre-commit failpoint (H1/B3)."""
+        write transaction, then fire the pre-commit failpoint (H1/B3).
+
+        ``hints`` is passed through as-is (``None`` = preserve the stored
+        hints group; a dict = replace the group) — see
+        ``upsert_chapter_catalog_on`` for the exact rules."""
         chapter_id = self.backend.upsert_chapter_catalog_on(
             conn,
             novel_id=novel_id,
             order_key=order_key,
             blob_key=prepared.blob_key,
             profile=prepared.profile,
-            media_type=hints.get("media_type"),
-            charset=hints.get("charset"),
+            hints=hints,
             meta=meta,
             now=now,
         )
@@ -351,7 +362,7 @@ class Repository:
         order_key: str,
         prepared: PreparedPut,
         raw: bytes | None,
-        hints: dict[str, Any],
+        hints: dict[str, Any] | None,
         meta: dict[str, Any] | None,
     ) -> int:
         """Commit content + chapter catalog + metadata on ONE session (M20).
