@@ -1604,22 +1604,25 @@ class SqliteBackend:
         payload_rows_deleted = 0
         with self.session() as s:
             check_cancel(cancel)
-            self._stage_temp_live(s, live, cancel)
-            if self.mode == "sqlite_single":
-                pending: Sequence[int | None] = [None]
-            else:
-                # The filesystem list PLUS every shard id encodings still
-                # reference: a vanished shard file must still get its
-                # encodings-only pass (never recreated).
-                referenced = {
-                    int(r[0])
-                    for r in s.query_all(
-                        "SELECT DISTINCT shard_id FROM encodings WHERE shard_id IS NOT NULL"
-                    )
-                }
-                pending = sorted(set(self.list_shards()) | referenced)
-            batch_size = self._gc_batch_size(s)
             try:
+                # r3-F: staging is INSIDE the guarded region, so a cancel
+                # (or any failure) mid-stage still drops the TEMP tables
+                # instead of leaking them until session close.
+                self._stage_temp_live(s, live, cancel)
+                if self.mode == "sqlite_single":
+                    pending: Sequence[int | None] = [None]
+                else:
+                    # The filesystem list PLUS every shard id encodings still
+                    # reference: a vanished shard file must still get its
+                    # encodings-only pass (never recreated).
+                    referenced = {
+                        int(r[0])
+                        for r in s.query_all(
+                            "SELECT DISTINCT shard_id FROM encodings WHERE shard_id IS NOT NULL"
+                        )
+                    }
+                    pending = sorted(set(self.list_shards()) | referenced)
+                batch_size = self._gc_batch_size(s)
                 for i0 in range(0, len(pending), batch_size):
                     batch = pending[i0 : i0 + batch_size]
                     check_cancel(cancel)

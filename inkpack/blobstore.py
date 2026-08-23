@@ -1052,6 +1052,10 @@ class BlobStore:
                     blob_key = str(row["blob_key"])
                     # A5: metadata invariants first (free integer compares),
                     # so a lying row is reported corrupt without a decode.
+                    # Precedence (decision D): a key that fails to parse is
+                    # corrupt on its own — blobs_raw_len is deliberately NOT
+                    # consulted for such a row (there is no well-formed key
+                    # to compare it against).
                     try:
                         expected_len, expected_sha, expected_blake = self.identity.parse(blob_key)
                     except ValueError:

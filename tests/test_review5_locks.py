@@ -314,7 +314,7 @@ def test_single_mode_does_not_validate_shard_caps(tmp_path):
         tmp_path / "s",
         backend_mode="sqlite_single",
         profiles={"raw": Profile("raw", "none", {})},
-        shard_min_bytes=0,
+        min_shard_cap_bytes=0,
         shard_cap_bytes=1,
     )
     assert repo.backend.mode == "sqlite_single"

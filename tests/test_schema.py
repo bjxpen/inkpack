@@ -172,7 +172,7 @@ def test_create_repo_validation(tmp_path):
     with pytest.raises(ValueError):
         create_repo(tmp_path / "d", backend_mode="sqlite_sharded", shard_cap_bytes=0, profiles={"raw": Profile("raw", "none")})
     with pytest.raises(ValueError):
-        create_repo(tmp_path / "e", backend_mode="sqlite_sharded", shard_min_bytes=10, shard_cap_bytes=5, profiles={"raw": Profile("raw", "none")})
+        create_repo(tmp_path / "e", backend_mode="sqlite_sharded", min_shard_cap_bytes=10, shard_cap_bytes=5, profiles={"raw": Profile("raw", "none")})
     with pytest.raises(ValueError):
         create_repo(tmp_path / "f", backend_mode="sqlite_single", pragmas={"journal_mode": "WAL"}, profiles={"raw": Profile("raw", "none")})
     with pytest.raises(ValueError):
@@ -189,7 +189,7 @@ def test_open_repo_restores_shard_caps(tmp_path):
         backend_mode="sqlite_sharded",
         profiles={"raw": Profile("raw", "none")},
         shard_cap_bytes=1 << 20,
-        shard_min_bytes=1 << 19,
+        min_shard_cap_bytes=1 << 19,
     )
     reopened = open_repo(tmp_path / "caps")
     assert reopened.backend.shard_cap_bytes == 1 << 20
