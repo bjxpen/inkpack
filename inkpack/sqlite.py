@@ -1317,7 +1317,11 @@ class SqliteBackend:
         )
 
     def update_novel(self, novel_id: int, title: str | None = None, slug: str | None = None) -> bool:
-        """Update the provided fields; returns False when the novel is missing."""
+        """Update the provided fields; returns False when the novel is missing.
+
+        ``None`` means "leave unchanged"; a field is only ever overwritten,
+        never cleared — to blank a slug pass ``""`` (not ``None``).
+        """
         novel_id = _require_pk(novel_id, "novel_id")
         sets: list[str] = []
         params: list[Any] = []
@@ -1447,6 +1451,11 @@ class SqliteBackend:
             )
 
     def meta_get(self, entity_type: str, entity_id: int | str, key: str) -> Any:
+        """Return the stored value for ``key``.
+
+        A missing key and a stored JSON ``null`` both return ``None`` — the
+        two are not distinguishable (use ``meta_list`` to tell them apart).
+        """
         entity_type, entity_id = self._normalize_entity(entity_type, entity_id)
         row = self._query_one(
             "SELECT value_json FROM meta WHERE entity_type=? AND entity_id=? AND key=?",

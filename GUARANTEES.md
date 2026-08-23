@@ -168,4 +168,31 @@ writers quiesce.
 one context instead of one per target. The one-shot `compress`/`decompress`
 APIs are share-safe in the pinned `zstandard` dependency (≥0.22,<1); if a
 future version changes that, the fallback is a thread-local cache. Contexts
-are keyed by the dictionary **id string**, never by `id(bytes)`.
+are keyed by the dictionary **id string**, never by `id(bytes)`. The context
+cache is process-wide and lock-protected (safe for independent operations on
+different threads sharing one engine).
+
+## Recovery runbook
+
+Operator steps for the failure modes the guarantees above specify
+(C4/S2/A2). "Move aside" means `mv payload/shard-NNNN.sqlite <backup>/` —
+never delete the only copy of a live shard.
+
+1. **Junk/malformed shard → `open_repo` refuses (C4).** Move
+   `payload/shard-NNNN.sqlite` aside. Open.
+   `gc(live=iter_live_content())` does the encodings-only pass for that
+   shard's rows and never recreates the file.
+2. **Corrupt current-write shard on an already-open repo.** After P1.2, new
+   puts roll to `max+1` (`CorruptContent` no longer bricks new writes) —
+   but **rolling protects new writes only**: content already on the corrupt
+   shard is unreadable (reads raise `CorruptContent`); restore that shard
+   from backup or accept the loss. After a restart with the junk file still
+   present, C4 still refuses open — move it aside (step 1).
+3. **Maintenance vs junk.** Until GC/compact degrade on unusable shards
+   (open question in the r4.1 document), `gc` and `compact` ABORT on a
+   present-but-unusable shard (`attach` → `CorruptContent`; `VACUUM` →
+   `InkpackError`). Move the shard aside before running them; puts tolerate
+   junk (after P1.2), maintenance does not.
+4. **`synchronous=NORMAL`.** The last committed transaction may be lost on a
+   power failure. Use `synchronous=FULL` if this repository is a source of
+   truth.

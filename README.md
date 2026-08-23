@@ -57,10 +57,11 @@ Requires Python ≥ 3.11.
 
 ## Quickstart
 
-The block below is **executable as written** (pinned by
-`tests/test_r2_docs.py::test_readme_runnable_blocks_execute`): a fresh
-repository in your home directory, exercising the full
-write → read → maintain surface.
+The fences marked `<!-- runnable -->` are **executable as written** (pinned by
+`tests/test_r2_docs.py` — including a guard that every ref the quickstart
+still holds a name for must be readable after its own GC). The demo fence
+exercises the full write → read → maintain surface; the cleanup fence shows
+the catalog-only delete + GC reclamation pattern.
 
 <!-- runnable -->
 ```python
@@ -78,72 +79,86 @@ repo = create_repo(
 store = repo.store
 
 # --- content -------------------------------------------------------------
-put = store.put_bytes(b"chapter body \x00\xff (opaque bytes)", profile="raw")
-ref = put.result.ref                        # ContentRef(blob_key, profile)
-assert store.get_bytes(ref) == b"chapter body \x00\xff (opaque bytes)"
-handle = store.open(ref)                    # io.BytesIO, safe to hold
-data = handle.read()
-
-# streaming put (non-seekable sources OK; hashed in one pass)
-chapter_path = Path("chapter.txt")
-chapter_path.write_bytes(b"streamed chapter body")
-with open(chapter_path, "rb") as fh:
-    put = store.put_stream(fh, profile="zstd_nodict").result
-
-# --- repository model -----------------------------------------------------
+# The demo writes its bytes as CHAPTERS: raw BlobStore puts are invisible to
+# repository GC unless you pass them in live, so a standalone put_bytes()
+# would be reclaimed by the GC below. (Dedupe makes writing the same bytes
+# as a chapter free.)
 novel_id = repo.create_novel("My Novel", meta={"genre": "fantasy"})
 chapter_id = repo.upsert_chapter(
-    novel_id, "ch-001", b"once upon a time...", "zstd_nodict",
+    novel_id, "ch-001", b"chapter body \x00\xff (opaque bytes)", "raw",
     hints={"media_type": "text/plain", "charset": "utf-8"},
     meta={"words": 4200},
 )
-assert repo.get_chapter_bytes(chapter_id) == b"once upon a time..."
-assert repo.open_chapter(chapter_id).read() == b"once upon a time..."
-body_ref = next(repo.iter_live_content())
-assert store.has_blob(body_ref.blob_key) is True
+ref = next(repo.iter_live_content())          # ContentRef(blob_key, profile)
+assert store.get_bytes(ref) == b"chapter body \x00\xff (opaque bytes)"
+handle = store.open(ref)                      # io.BytesIO, safe to hold
+data = handle.read()
+assert store.has_blob(ref.blob_key) is True   # True iff a blobs row exists (decision A)
+
+# streaming chapter upsert (progress events, atomic content+catalog commit);
+# streams are consumed, so use a FRESH handle
+chapter_path = Path("chapter.txt")
+chapter_path.write_bytes(b"streamed chapter body")
+with open(chapter_path, "rb") as fh:
+    op = repo.upsert_chapter_stream(fh, novel_id, "ch-002", "zstd_nodict")
+    chapter2_id = op.result                   # int; OpEvents while iterating
+
+# --- repository model -----------------------------------------------------
+assert repo.get_chapter_bytes(chapter_id) == b"chapter body \x00\xff (opaque bytes)"
+assert repo.open_chapter(chapter_id).read() == b"chapter body \x00\xff (opaque bytes)"
 repo.meta_set("novel", novel_id, "rating", 5)
 assert repo.meta_get("novel", novel_id, "rating") == 5
 assert repo.meta_list("chapter", chapter_id)["words"] == 4200
 
 # --- catalog (no bodies) ---------------------------------------------------
-novel = repo.get_novel(novel_id)             # dict row; NotFound if missing
+novel = repo.get_novel(novel_id)              # dict row; NotFound if missing
 repo.update_novel(novel_id, title="My Novel (retitled)", slug="my-novel")
-chapters = repo.list_chapters(novel_id)      # list[ChapterInfo], no bodies, ordered by order_key
+chapters = repo.list_chapters(novel_id)       # list[ChapterInfo], no bodies, ordered by order_key
                                            # (order_key is a TEXT sort: zero-pad, e.g. "001")
-info = repo.get_chapter(chapter_id)          # ChapterInfo
-
-# streaming chapter upsert (progress events, atomic content+catalog commit);
-# streams are consumed, so use a FRESH handle
-with open(chapter_path, "rb") as fh:
-    op = repo.upsert_chapter_stream(fh, novel_id, "ch-002", "zstd_nodict")
-    chapter2_id = op.result                  # int; OpEvents while iterating
+info = repo.get_chapter(chapter_id)           # ChapterInfo
 
 # --- dictionaries ---------------------------------------------------------
 trained = store.train_dict([b"sample prose " * 100] * 5).result
 repo.set_profile(Profile("zstd_dict", "zstd", {"level": 6}, trained.dict_id))
-put = store.put_bytes(b"sample prose " * 2000, profile="zstd_dict").result
-assert put.zstd_dict_id == trained.dict_id
+# (Until a profile or an encoding references a trained dict, the NEXT gc()
+# reclaims it — the profile assignment above pins it.)
+repo.upsert_chapter(novel_id, "ch-003", b"sample prose " * 2000, "zstd_dict")
+dict_ref = next(
+    r for r in repo.iter_live_content(scope=novel_id) if r.profile == "zstd_dict"
+)
+assert store.get_bytes(dict_ref) == b"sample prose " * 2000
 
 # --- maintenance -----------------------------------------------------------
-verify = store.verify().result               # VerifyResult(checked, ok, missing, corrupt)
+verify = store.verify().result                # VerifyResult(checked, ok, missing, corrupt)
 assert verify.missing == 0 and verify.corrupt == 0
-live = list(repo.iter_live_content())        # ContentRefs referenced by chapters
-gc = store.gc(live=live).result              # GcResult(...)
-compacted = store.compact().result           # CompactResult(mode, targets)
-reencoded = store.reencode(live).result      # ReencodeResult(...)
-
-# --- deletes are catalog-only (D12) ----------------------------------------
-repo.delete_chapter(chapter2_id)             # then gc(iter_live_content()) reclaims
-repo.delete_novel(novel_id, cascade=True)    # content reclaimed by gc
-
-# --- reopen ----------------------------------------------------------------
-from inkpack import open_repo
-repo2 = open_repo("~/novels")
-assert repo2.get_profiles().keys() == {"raw", "zstd_nodict", "zstd_dict"}
+# NOTE: raw BlobStore puts are invisible to repository GC unless you pass
+# them in live — gc(live) reclaims only what is NOT referenced by chapters.
+live = list(repo.iter_live_content())         # ContentRefs referenced by chapters
+gc = store.gc(live=live).result               # GcResult(...)
+compacted = store.compact().result            # CompactResult(mode, targets)
+reencoded = store.reencode(live).result       # ReencodeResult(...)
 ```
 
 `store.has_blob(key)` is True iff a `blobs` catalog row exists (decision A)
 — it does not mean that `ContentRef` is currently readable.
+
+<!-- runnable -->
+```python
+# --- deletes are catalog-only (D12), then reclaim and reopen ---------------
+from pathlib import Path
+from inkpack import open_repo
+
+repo = open_repo(Path.home() / "novels")      # the demo's repository
+novel_id = repo.list_novels()[0]["id"]
+for cid in [c.id for c in repo.list_chapters(novel_id)]:
+    repo.delete_chapter(cid)                  # catalog only
+repo.delete_novel(novel_id, cascade=True)     # catalog only; content reclaimed by gc
+repo.store.gc(live=list(repo.iter_live_content())).result
+verify = repo.store.verify().result
+assert verify.ok == 0 and verify.missing == 0 and verify.corrupt == 0
+repo2 = open_repo("~/novels")
+assert repo2.get_profiles().keys() == {"raw", "zstd_nodict", "zstd_dict"}
+```
 
 ---
 
@@ -251,6 +266,11 @@ never at the first `put`.
   (valid range 256 .. 67,108,864; the actual trained dictionary may be
   smaller). Requires at least **5 non-empty samples** totaling **≥ 8 bytes**
   (constraints of zstd's dictionary trainer).
+
+**Reclamation rule:** a trained dictionary is reclaimable by the next
+`gc()` until a profile or an encoding references it — `train_dict` alone
+pins nothing, so `train_dict → gc` (without `set_profile` or a put under a
+dict profile) silently loses the dict.
 
 ### `reencode` options
 
@@ -464,6 +484,16 @@ Stored in `repo_config` as canonical JSON: `identity_policy` (must be
 and (sharded) `shard_cap_bytes`, `shard_min_bytes`. `open_repo()` validates
 them (identity policy, profiles present, backend-mode match) and restores the
 stored shard caps.
+
+### Recovery runbook
+
+Operator steps for the failure modes the guarantees specify — a junk/malformed
+shard that makes `open_repo` refuse, a corrupt current-write shard on an
+already-open repo, maintenance vs a junk shard, and `synchronous=NORMAL` —
+live in [GUARANTEES.md → Recovery runbook](GUARANTEES.md#recovery-runbook).
+Short version: move the bad `payload/shard-NNNN.sqlite` aside (never delete
+the only copy), reopen, and `gc(live=iter_live_content())` does the
+encodings-only pass; restore the shard from backup for content already on it.
 
 ---
 

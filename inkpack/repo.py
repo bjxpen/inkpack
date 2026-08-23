@@ -240,6 +240,11 @@ class Repository:
 
         A failure (e.g. missing novel, busy) leaves no orphan blob or empty
         shard behind.
+
+        ``chapter_key`` is stored as ``order_key`` and ordered by a **TEXT
+        sort** (``"1" < "10" < "2"``) — zero-pad for numeric order (e.g.
+        ``"001"``). For multi-MB bodies prefer
+        :meth:`upsert_chapter_stream` (cancel + live progress).
         """
         novel_id = self._require_novel_id(novel_id)
         order_key = self._normalize_chapter_key(chapter_key)
@@ -264,7 +269,12 @@ class Repository:
         cancel: CancelToken | None = None,
     ) -> Operation[int]:
         """Streaming upsert: hashes the stream (live progress events) then
-        commits content + catalog atomically. Returns an Operation[int]."""
+        commits content + catalog atomically. Returns an Operation[int].
+
+        ``chapter_key`` becomes ``order_key`` (TEXT sort — zero-pad for
+        numeric order). The preferred form for multi-MB bodies: cancel +
+        live progress, and the source is read in one pass.
+        """
         del size_hint
         novel_id = self._require_novel_id(novel_id)
         order_key = self._normalize_chapter_key(chapter_key)
@@ -451,6 +461,9 @@ class Repository:
         self.backend.meta_set(entity_type, entity_id, key, value)
 
     def meta_get(self, entity_type: str, entity_id: int | str, key: str) -> Any:
+        """KV lookup. A missing key and a stored JSON ``null`` both return
+        ``None`` (not distinguishable; use ``meta_list`` to tell them apart).
+        """
         return self.backend.meta_get(entity_type, entity_id, key)
 
     def meta_list(self, entity_type: str, entity_id: int | str) -> dict[str, Any]:
@@ -459,9 +472,19 @@ class Repository:
     def iter_live_content(self, scope: int | None = None) -> Iterator[ContentRef]:
         """Distinct content refs referenced by chapters (optionally one novel).
 
-        Paged (C3): each page is a short read transaction, so the iterator is
-        **weakly consistent but monotone-safe for GC staging** — a concurrent
-        upsert may appear in a later page, and a ref deleted mid-drain may be
-        retained (safe over-retention); a live ref is never missed.
+        Visibility (C3): **at least that of a single-snapshot fetch taken at
+        drain start** — a row present at the first page's snapshot sits at a
+        fixed key, and the ascending keyset sweep cannot skip it, even under
+        concurrent writers; late additions whose key sorts above the cursor
+        appear in a later page; mid-drain deletions cause safe over-retention.
+
+        Live-set freshness obligation (normative for callers): the exposure
+        window is **commits during or after the drain** — such chapters are
+        not represented, and ``gc`` will reclaim their content (recovery:
+        re-run the upsert). See GUARANTEES.md.
+
+        Honest footnote: a start-present key can be *delayed* indefinitely if
+        writers keep inserting keys that sort below it; a FINISHED drain
+        still cannot skip it.
         """
         yield from self.backend.iter_chapter_refs(scope=scope)

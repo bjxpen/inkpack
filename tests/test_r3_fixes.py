@@ -119,6 +119,18 @@ def test_guarantees_state_live_set_freshness_and_honest_visibility():
     assert "never miss a live ref" not in readme
 
 
+def test_no_never_miss_live_ref_claim_anywhere():
+    """P0.3: the overclaim is gone from ALL three surfaces — GUARANTEES.md,
+    README.md, and the iter_live_content docstring in inkpack/repo.py (which
+    the r3-B guard did not cover). Simplified: one loop, both phrases, all
+    files."""
+    phrases = ("never miss a live ref", "never missed")
+    for rel in ("GUARANTEES.md", "README.md", "inkpack/repo.py"):
+        text = _norm((ROOT / rel).read_text()).lower()
+        for p in phrases:
+            assert p not in text, f"{rel}: {p!r}"  # TODAY: repo.py contains 'never missed'
+
+
 # ---------------------------------------------------------------------------
 # C — verify pagination must be seek-shaped (EQP plan-shape gate)
 # ---------------------------------------------------------------------------

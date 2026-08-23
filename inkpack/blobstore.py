@@ -236,9 +236,15 @@ class BlobStore:
                 # (B3: the window a racing gc can exploit).
                 failpoint("prepare.post_hit_probe")
                 # Healthy dedupe hit (decision E): report the stored row as-is.
-                # "put succeeded" must imply "content is readable": undecodable
-                # stored metadata (A4) or a vanished required dictionary is a
-                # typed error, not a silent hit (review §4.2, P1-5).
+                # "put succeeded" must imply "content is readable" (N7): the
+                # hit enforces exactly what DECODE enforces — the
+                # codec/dict-id pairing (A4), the dict row's presence,
+                # stored_len, and the S3 bound — and NOTHING more. It does not
+                # parse ``codec_params_json``: decode ignores it (L27 — the
+                # frame is the source of truth), so a hit with non-object
+                # params is genuinely readable and must succeed. (Repair is
+                # the opposite: it must ENCODE, so it does reject unusable
+                # params via profile_from_encoding_row — M8.)
                 self._check_stored_codec_dict(row, ContentRef(blob_key, profile))
                 if row["zstd_dict_id"] is not None and s.dict_bytes(str(row["zstd_dict_id"])) is None:
                     raise MissingContent(
@@ -783,6 +789,13 @@ class BlobStore:
         options: dict[str, Any] | None = None,
         cancel: CancelToken | None = None,
     ) -> Operation[TrainDictResult]:
+        """Train a zstd dictionary and store it in the index DB.
+
+        Reclamation rule: the dictionary is reclaimable by the next ``gc()``
+        until a profile or an encoding references it — ``train_dict`` alone
+        pins nothing, so ``train_dict -> gc`` (without ``set_profile`` or a
+        put under a dict profile) silently loses the dict.
+        """
         # Eager option validation (review P2-OPT-1): bad options fail at call
         # time, before an Operation exists.
         validate_train_dict_options(options)
@@ -1115,7 +1128,13 @@ class BlobStore:
         return Operation(_run)
 
     def gc(self, live: Iterable[ContentRef], cancel: CancelToken | None = None) -> Operation[GcResult]:
-        """Delete encodings/payloads not in ``live``, then orphan blobs and dicts."""
+        """Delete encodings/payloads not in ``live``, then orphan blobs and dicts.
+
+        Emits only ``start``/``done`` (per-batch ``item`` events land with
+        P3.1). The per-batch exclusive window can be long for large dead
+        sets — see the GUARANTEES.md duration note; cancel between batches
+        keeps committed batches.
+        """
 
         def _run() -> Generator[OpEvent, None, GcResult]:
             check_cancel(cancel)

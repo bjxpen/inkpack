@@ -704,11 +704,17 @@ digest first (no spool read on hit); a miss/repair reads the spool and
 re-binds with `identity.key_bytes(raw)` (forged digests refused). Correctness
 over skipping a hash.
 
-**D7 — Stored metadata is authoritative.** Stored encoding metadata that is
-not a usable policy (unparsable/non-object `codec_params_json`, `codec
-'none'` with a dict id, engine-rejected params) is `CorruptContent`, not
-`ValueError` and not a silent default. Caller-supplied policy (new profile,
-ad-hoc reencode options) stays `ValueError` at the call boundary.
+**D7 — Stored metadata is authoritative.** Precise split (r4-P0.4): a
+**hit/read** enforces exactly what decode enforces — the codec/dict-id
+pairing, the dict row's presence, `stored_len`, and the S3 bound — as a typed
+error, never a silent success; `codec_params_json` is **not** in that set
+(decode ignores it, L27 — the frame is the source of truth), so a hit with
+non-object params is readable and succeeds. A **repair / new encode from a
+stored row** enforces the full write policy: unparsable/non-object
+`codec_params_json` or engine-rejected params is `CorruptContent`, not
+`ValueError` and not a silent default (repair must encode). Caller-supplied
+policy (new profile, ad-hoc reencode options) stays `ValueError` at the call
+boundary.
 
 **D8 — Strict open-time config.** `open_repo` validates `identity_policy`,
 `backend_mode`, profiles (missing → `InkpackError("…profiles missing…")`),
