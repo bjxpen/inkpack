@@ -428,7 +428,11 @@ DBs). Key invariants:
   row absent) / `corrupt`. `corrupt` covers decode failure, identity
   mismatch, a damaged payload schema, a missing/lying `blobs.raw_len`, and a
   lying `stored_len` (A3/A5). `MemoryError` is never counted as corrupt — it
-  aborts the run (A7).
+  aborts the run (A7). The checked set is **frozen at run start** (the
+  iteration order is materialized once, then paged by keyset seek — one sort
+  total, never a per-page full-table sort): encodings added mid-verify are
+  picked up by the next run; encodings deleted mid-verify classify as
+  `missing`.
 - `gc(live)` deletes encodings + payloads not in the live set in **batched
   atomic exclusive windows** (Decision G amendment, B1): each batch of up to
   the attach-limit shards runs one `BEGIN IMMEDIATE … COMMIT` that

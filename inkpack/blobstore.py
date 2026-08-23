@@ -948,46 +948,72 @@ class BlobStore:
     # -- maintenance (spec 10) -------------------------------------------------
 
     def _iter_encodings(self, s: Session, limit: int | None) -> Iterator[sqlite3.Row]:
-        """Keyset-paged, shard-ordered iteration over encodings (A5/C1).
+        """Keyset-paged, shard-ordered iteration over encodings (A5/C1, r3-C).
 
-        - Joins ``blobs.raw_len`` so verify enforces the raw_len MUST
-          (decision J) per row instead of materializing a blobs map (review
-          §15: a million-blob dict is exactly what this prevents).
-        - Orders by ``(shard_id, blob_key, profile)`` so consecutive rows hit
-          the same shard: with session-managed attaches (C1) a bulk verify
-          costs O(shards) attaches, not O(rows). NULL shard_ids (tampered
-          locators) sort first via COALESCE, which keeps the keyset
-          comparison total (row-value compares involving NULL would not be).
+        The iteration order is materialized ONCE per run into a WITHOUT ROWID
+        temp table whose PK is the keyset ``(ord_shard, blob_key, profile)``,
+        then paged with keyset seeks. The previous per-page
+        ``ORDER BY COALESCE(shard_id, -1), ...`` matched no index, so EVERY
+        page re-scanned and re-sorted the whole ``encodings`` table —
+        O(pages · N log N), a cliff precisely at the scale C1 targets. Now:
+        one sort total, and keyset pages seek the PK.
+
+        - Carries ``blobs.raw_len`` (decision J) per row instead of
+          materializing a blobs map (review §15).
+        - Keeps ``(shard_id, blob_key, profile)`` order so consecutive rows
+          hit the same shard: session attaches (C1) cost O(shards), not
+          O(rows). NULL shard_ids (tampered locators) sort first via
+          COALESCE, which keeps the keyset comparison total.
+
+        Semantic delta (changelog): the checked set is FROZEN at
+        materialization — encodings added mid-verify are picked up by the
+        next run; encodings deleted mid-verify classify as ``missing``
+        (previously the per-page snapshots could see either state).
         """
-        order = "COALESCE(e.shard_id, -1), e.blob_key, e.profile"
-        base = (
-            "SELECT e.*, b.raw_len AS blobs_raw_len FROM encodings e "
-            "LEFT JOIN blobs b ON b.blob_key = e.blob_key "
+        s.execute("DROP TABLE IF EXISTS _verify_order")
+        s.execute(
+            "CREATE TEMP TABLE _verify_order("
+            "  ord_shard     INTEGER NOT NULL,"
+            "  blob_key      TEXT    NOT NULL,"
+            "  profile       TEXT    NOT NULL,"
+            "  blobs_raw_len INTEGER,"
+            "  PRIMARY KEY (ord_shard, blob_key, profile)"
+            ") WITHOUT ROWID"
         )
-        last: tuple[int, str, str] | None = None
-        remaining = limit
-        while True:
-            if last is None:
-                rows = s.query_all(f"{base}ORDER BY {order} LIMIT ?", (_PAGE_SIZE,))
-            else:
-                rows = s.query_all(
-                    f"{base}WHERE (COALESCE(e.shard_id, -1), e.blob_key, e.profile) > (?, ?, ?) "
-                    f"ORDER BY {order} LIMIT ?",
-                    (last[0], last[1], last[2], _PAGE_SIZE),
-                )
-            if not rows:
-                return
-            for row in rows:
-                if remaining is not None:
-                    if remaining <= 0:
-                        return
-                    remaining -= 1
-                yield row
-                last = (
-                    -1 if row["shard_id"] is None else int(row["shard_id"]),
-                    str(row["blob_key"]),
-                    str(row["profile"]),
-                )
+        s.execute(
+            "INSERT INTO _verify_order(ord_shard, blob_key, profile, blobs_raw_len) "
+            "SELECT COALESCE(e.shard_id, -1), e.blob_key, e.profile, b.raw_len "
+            "FROM encodings e LEFT JOIN blobs b ON b.blob_key = e.blob_key"
+        )
+        try:
+            last: tuple[int, str, str] | None = None
+            remaining = limit
+            while True:
+                if last is None:
+                    rows = s.query_all(
+                        "SELECT ord_shard, blob_key, profile, blobs_raw_len "
+                        "FROM _verify_order ORDER BY ord_shard, blob_key, profile LIMIT ?",
+                        (_PAGE_SIZE,),
+                    )
+                else:
+                    rows = s.query_all(
+                        "SELECT ord_shard, blob_key, profile, blobs_raw_len "
+                        "FROM _verify_order "
+                        "WHERE (ord_shard, blob_key, profile) > (?, ?, ?) "
+                        "ORDER BY ord_shard, blob_key, profile LIMIT ?",
+                        (last[0], last[1], last[2], _PAGE_SIZE),
+                    )
+                if not rows:
+                    return
+                for row in rows:
+                    if remaining is not None:
+                        if remaining <= 0:
+                            return
+                        remaining -= 1
+                    yield row
+                    last = (int(row["ord_shard"]), str(row["blob_key"]), str(row["profile"]))
+        finally:
+            s.execute("DROP TABLE IF EXISTS _verify_order")
 
     def verify(
         self,
