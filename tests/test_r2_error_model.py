@@ -80,30 +80,38 @@ def test_open_repo_corrupt_shard_is_typed_error(repo_sharded):
 # ---------------------------------------------------------------------------
 
 
-def test_put_over_unusable_shard_is_corruptcontent(repo_sharded):
-    """Connect succeeds (valid header); the dedupe payload probe fails.
-
-    This pins the broadened ``Session._shard_query_one`` catch — a
-    ``DatabaseError`` raised there previously escaped raw (only
-    ``OperationalError`` was translated).
-    """
-    ref = repo_sharded.store.put_bytes(b"hello" * 50, "raw").result.ref
-    corrupt_shard_btree_page(repo_sharded, ref)
-    with pytest.raises(CorruptContent):  # today: raw sqlite3.DatabaseError
-        repo_sharded.store.put_bytes(b"hello" * 50, "raw").result
-
-
-def test_put_over_junk_shard_is_corruptcontent(repo_sharded):
-    """Garbage file (no valid header): connect-phase classification."""
+def test_put_over_junk_shard_rehomes(repo_sharded):
+    """r4-P1.2 retarget (was test_put_over_junk_shard_is_corruptcontent): a
+    present-but-unusable (junk) shard no longer fails the WRITE path — the
+    put REHOMES off it. The A2 "no raw sqlite" lock is preserved: no
+    sqlite3.Error may leak, and the new write must land on a usable shard and
+    be readable."""
     ref = repo_sharded.store.put_bytes(b"hello" * 50, "raw").result.ref
     row = enc_row(repo_sharded, ref)
-    repo_sharded.backend.shard_path(int(row["shard_id"])).write_bytes(b"junk-junk")
-    with pytest.raises(CorruptContent):
-        repo_sharded.store.put_bytes(b"hello" * 50, "raw").result
+    junk_sid = int(row["shard_id"])
+    repo_sharded.backend.shard_path(junk_sid).write_bytes(b"junk-junk")
+    second = repo_sharded.store.put_bytes(b"hello" * 50, "raw").result  # rehomed
+    assert repo_sharded.store.get_bytes(second.ref) == b"hello" * 50
+    assert int(enc_row(repo_sharded, second.ref)["shard_id"]) != junk_sid
+
+
+def test_put_over_unusable_shard_rehomes(repo_sharded):
+    """r4-P1.2 retarget (was test_put_over_unusable_shard_is_corruptcontent):
+    a valid-header-but-corrupt-body shard (btree page clobbered) is a write-
+    side MISS — the put rehomes and no sqlite3.Error leaks. Capture the
+    original shard BEFORE the rehome: the re-put is the same content, so it
+    shares the blob_key and the encoding row is the (rehomed) one."""
+    ref = repo_sharded.store.put_bytes(b"hello" * 50, "raw").result.ref
+    orig_sid = int(enc_row(repo_sharded, ref)["shard_id"])
+    corrupt_shard_btree_page(repo_sharded, ref)
+    second = repo_sharded.store.put_bytes(b"hello" * 50, "raw").result  # rehome
+    assert repo_sharded.store.get_bytes(second.ref) == b"hello" * 50
+    assert int(enc_row(repo_sharded, second.ref)["shard_id"]) != orig_sid
 
 
 def test_get_bytes_over_corrupt_shard_is_corruptcontent(repo_sharded):
-    """The read path must classify the same corruption the same way (A2)."""
+    """A2 read pin, UNCHANGED by P1.2: a read on a present-but-unusable shard
+    still classifies CorruptContent (only the write path rehomes)."""
     ref = repo_sharded.store.put_bytes(b"hello" * 50, "raw").result.ref
     row = enc_row(repo_sharded, ref)
     repo_sharded.backend.shard_path(int(row["shard_id"])).write_bytes(b"junk-junk")

@@ -348,26 +348,24 @@ def test_missing_shard_never_connects(repo_sharded, monkeypatch):
     assert prepared.enc is not None  # missing payload -> repair path, not a healthy hit
 
 
-def test_present_unusable_shard_is_corrupt(repo_sharded, monkeypatch):
-    """G2(b): a PRESENT shard file whose connection fails with a generic
-    OperationalError is CorruptContent (present-but-unusable), never Busy
-    and never a raw leak."""
-    import inkpack.sqlite as sqlite_mod
+def test_present_unusable_shard_is_corrupt(repo_sharded):
+    """G2(b), r4-P1.2 retarget to a READ-path pin: a PRESENT-but-unusable
+    shard classifies as CorruptContent on a READ (A2/C4), never a raw leak.
+    Kept as a read test (not a put): the original fixture patched
+    ``connect_file`` for every ``shard-*`` path, which would also kill the
+    NEW shard's creation during a put's rehome (P1.2) — a put retarget would
+    require scoping the injection to the original filename. Puts now REHOME
+    off an unusable shard instead (see test_put_over_junk_shard_rehomes);
+    only reads still classify it CorruptContent."""
+    from .conftest import enc_row
 
     store = repo_sharded.store
     data = b"present-unusable"
-    store.put_bytes(data, "raw").result
-
-    real = sqlite_mod.connect_file
-
-    def shard_only(db_path, *args, **kwargs):
-        if db_path.name.startswith("shard-"):
-            raise sqlite3.OperationalError("I/O error")
-        return real(db_path, *args, **kwargs)
-
-    monkeypatch.setattr(sqlite_mod, "connect_file", shard_only)
+    ref = store.put_bytes(data, "raw").result.ref
+    sid = int(enc_row(repo_sharded, ref)["shard_id"])
+    repo_sharded.backend.shard_path(sid).write_bytes(b"not a sqlite db")
     with pytest.raises(CorruptContent):
-        store.put_bytes(data, "raw").result
+        store.get_bytes(ref)
 
 
 # ---------------------------------------------------------------------------

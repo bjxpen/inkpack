@@ -9,9 +9,9 @@ from __future__ import annotations
 
 import pytest
 
-from inkpack import MissingContent, Profile
+from inkpack import Busy, CorruptContent, MissingContent, Profile
 
-from .conftest import delete_dict, enc_row, payload_bytes  # noqa: F401  (payload_bytes: later PRs)
+from .conftest import delete_dict, delete_payload_row, enc_row, payload_bytes  # noqa: F401
 
 PROFILES = {
     "raw": Profile("raw", "none", {}),
@@ -189,3 +189,63 @@ def test_n7_hit_rechecks_dict_in_the_write_txn(repo, monkeypatch):
     with pytest.raises(MissingContent):  # TODAY: succeeds via the poisoned cache
         repo.store.put_bytes(data, "zstd_d").result
     assert enc_row(repo, first.ref) is not None  # hit must not rewrite
+
+
+# ---------------------------------------------------------------------------
+# P1.2 [FAIL-FIRST] — S2: a present-but-unusable shard is rehomed off, not
+# bricked; reads still classify it CorruptContent (A2)
+# ---------------------------------------------------------------------------
+
+
+def test_new_put_rolls_past_corrupt_highest_shard(repo_sharded):
+    """[FAIL-FIRST] a junk HIGHEST shard must not brick new writes (no locator
+    to rehome from) — the write rolls to max+1. TODAY: CorruptContent."""
+    first = repo_sharded.store.put_bytes(b"keep-me" * 50, "raw").result
+    sid = int(enc_row(repo_sharded, first.ref)["shard_id"])
+    repo_sharded.backend.shard_path(sid).write_bytes(b"not a sqlite db")
+    second = repo_sharded.store.put_bytes(b"fresh" * 50, "raw").result  # TODAY: CorruptContent
+    assert repo_sharded.store.get_bytes(second.ref) == b"fresh" * 50
+    assert int(enc_row(repo_sharded, second.ref)["shard_id"]) != sid
+
+
+def test_repair_rehomes_off_unusable_locator(repo_sharded):
+    """[FAIL-FIRST] a repair whose locator shard is unusable rehomes to a
+    writable shard (the payload is gone, so this is the repair branch).
+    TODAY: CorruptContent (payload_exists raised instead of missing)."""
+    data = b"rehome-unusable " * 80
+    put = repo_sharded.store.put_bytes(data, "raw").result
+    delete_payload_row(repo_sharded, put.ref)
+    sid = int(enc_row(repo_sharded, put.ref)["shard_id"])
+    repo_sharded.backend.shard_path(sid).write_bytes(b"junk-junk")
+    again = repo_sharded.store.put_bytes(data, "raw").result  # TODAY: CorruptContent
+    assert repo_sharded.store.get_bytes(again.ref) == data
+    assert int(enc_row(repo_sharded, again.ref)["shard_id"]) != sid
+
+
+def test_get_bytes_on_unusable_shard_still_corruptcontent(repo_sharded):
+    """[PIN] A2 read pin, unchanged: a read on a present-but-unusable shard
+    still raises CorruptContent (only the WRITE path rehomes)."""
+    ref = repo_sharded.store.put_bytes(b"read-me" * 50, "raw").result.ref
+    sid = int(enc_row(repo_sharded, ref)["shard_id"])
+    repo_sharded.backend.shard_path(sid).write_bytes(b"junk-junk")
+    with pytest.raises(CorruptContent):
+        repo_sharded.store.get_bytes(ref)
+
+
+def test_busy_shard_not_treated_unusable(repo_sharded, monkeypatch):
+    """[PIN] the except-ordering trap: a LOCKED (Busy) shard must raise Busy,
+    not be silently rolled off as "unusable". Busy subclasses InkpackError,
+    so a broad catch before the Busy catch would swallow it."""
+    import inkpack.sqlite as sqlite_mod
+
+    repo_sharded.store.put_bytes(b"busy-stay" * 50, "raw").result
+    real = sqlite_mod.connect_file
+
+    def shard_busy(db_path, *a, **k):
+        if db_path.name.startswith("shard-"):
+            raise Busy("database is locked")
+        return real(db_path, *a, **k)
+
+    monkeypatch.setattr(sqlite_mod, "connect_file", shard_busy)
+    with pytest.raises(Busy):
+        repo_sharded.store.put_bytes(b"busy-stay" * 50, "raw").result

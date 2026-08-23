@@ -701,7 +701,14 @@ class Session:
 
     def payload_exists(self, blob_key: str, profile: str, shard_id: int | None) -> bool:
         """Cheap existence probe (``SELECT 1``) — never reads the whole BLOB
-        (review P2-2)."""
+        (review P2-2).
+
+        WRITE-side semantics (P1.2): a present-but-unusable shard is a MISS
+        (``False``), so a put REHOMES / repairs off it instead of failing —
+        the write path tolerates junk. READS (via ``_read_snapshot``/attach)
+        still classify an unusable shard as ``CorruptContent`` (A2/C4).
+        ``Busy`` propagates either way (locked-but-healthy is not a miss).
+        """
         if self.backend.mode == "sqlite_single":
             row = self.query_one(
                 "SELECT 1 FROM payload WHERE blob_key=? AND profile=?", (blob_key, profile)
@@ -709,15 +716,21 @@ class Session:
             return row is not None
         if shard_id is None:
             return False
-        conn = self._shard_conn(int(shard_id))
+        try:
+            conn = self._shard_conn(int(shard_id))
+        except CorruptContent:
+            return False  # present-but-unusable: write-side miss (rehome)
         if conn is None:
             return False
-        row = self._shard_query_one(
-            conn,
-            "SELECT 1 FROM payload WHERE blob_key=? AND profile=?",
-            (blob_key, profile),
-            shard_id=int(shard_id),
-        )
+        try:
+            row = self._shard_query_one(
+                conn,
+                "SELECT 1 FROM payload WHERE blob_key=? AND profile=?",
+                (blob_key, profile),
+                shard_id=int(shard_id),
+            )
+        except CorruptContent:
+            return False  # file became unusable mid-session: write-side miss
         return row is not None
 
     def dict_bytes(self, dict_id: str) -> bytes | None:
@@ -766,6 +779,11 @@ class SqliteBackend:
     synchronous: str
     _blob_limit: int | None = field(default=None, init=False)
     _write_shard_id: int | None = field(default=None, init=False)
+    # P1.2: shards verified usable (this process's lifetime). Healthy writes
+    # pay zero extra probe connections — a bulk reencode over N targets must
+    # not open N probe connections. External rot after a cache hit fails at
+    # attach, as today.
+    _usable_shards: set[int] = field(default_factory=set[int], init=False)
 
     # -- construction -------------------------------------------------------
 
@@ -1917,16 +1935,62 @@ class SqliteBackend:
             seen[sid] = path.name
         return offenders
 
+    def _shard_usable(self, shard_id: int) -> bool:
+        """P1.2: is this shard file a usable SQLite DB (for WRITE routing)?
+
+        Missing -> False (never create, S2). Present-but-unusable (junk /
+        corrupt header or corrupt payload page) -> False, so a junk *current*
+        shard does not brick new writes — the write rolls to ``max+1``.
+        ``Busy`` is re-raised, NOT treated as unusable: a locked-but-healthy
+        shard must not be rolled off. ``Busy`` subclasses ``InkpackError``,
+        so the ``Busy`` catch MUST precede the broad one (else "Busy
+        propagates" silently dies). A process-lifetime ``_usable_shards``
+        cache means healthy writes pay zero extra connections.
+
+        The probe queries the ``payload`` table (not just ``sqlite_master``)
+        so it catches page-level corruption of the payload btree, not just a
+        corrupt header. A valid DB that simply lacks the payload table yet
+        (unmigrated) is USABLE — it is migrated on write, not corrupt.
+        """
+        if shard_id in self._usable_shards:
+            return True
+        path = self.shard_path(shard_id)
+        if not path.exists():
+            return False
+        try:
+            conn = connect_file(path, self.busy_timeout_ms, self.synchronous)
+        except Busy:
+            raise  # locked-but-healthy: do NOT roll off
+        except (InkpackError, OSError):
+            return False  # present-but-unusable (corrupt header / unreadable)
+        try:
+            conn.execute("SELECT 1 FROM payload LIMIT 1")
+        except sqlite3.Error as exc:
+            if _is_busy(exc):
+                raise Busy(str(exc)) from exc
+            if "no such table" in str(exc).lower():
+                # Valid DB, payload table not migrated yet -> usable (migrated
+                # on write), not corrupt.
+                self._usable_shards.add(shard_id)
+                return True
+            return False  # present-but-unusable (corrupt payload page)
+        finally:
+            with suppress(sqlite3.Error):
+                conn.close()
+        self._usable_shards.add(shard_id)
+        return True
+
     def resolve_write_shard(self, stored_len: int, current: int | None) -> int:
         """Pick the shard a payload write lands in (locked semantics S2/H2).
 
         Returns ``current`` when it is a usable existing shard; otherwise
         explicitly chooses AND ensures a writable shard (rehoming) — never
-        leaves creation to ATTACH.
+        leaves creation to ATTACH. P1.2: "usable" includes present-but-not-
+        junk — a corrupt current shard is rehomed off, not bricked.
         """
         if self.mode != "sqlite_sharded":
             return 0
-        if current is None or not self.shard_path(current).exists():
+        if current is None or not self._shard_usable(current):
             shard_id = self.choose_shard_for_write(stored_len)
             self.ensure_shard_exists(shard_id)
             return shard_id
@@ -1939,6 +2003,11 @@ class SqliteBackend:
         if self._write_shard_id is None or shard_id > self._write_shard_id:
             self._write_shard_id = shard_id
         _ensure_shard_file(self.payload_dir, shard_id, self.busy_timeout_ms, self.synchronous)
+        # NOTE: a freshly ensured shard is trusted only WITHIN the same
+        # choose/resolve call (via the caller's ``just_ensured``), NOT added
+        # to the process-lifetime ``_usable_shards`` cache — a shard file can
+        # be externally corrupted after creation, and a stale "usable" cache
+        # entry would then brick writes instead of rolling off (P1.2).
 
     def choose_shard_for_write(self, estimated_payload_bytes: int) -> int:
         """Pick the write shard: the highest existing id, rolling past the cap.
@@ -1946,16 +2015,35 @@ class SqliteBackend:
         ``max(ids)`` (not the lexically-last path) keeps shard-10000 from
         sorting before shard-9999 (review §8). The write pointer is cached on
         the instance; the glob remains the source for compact/validation.
+
+        P1.2: a present-but-unusable (junk) current shard rolls to the next
+        shard — N5/N6: the pointer only moves forward, and junk behind it is
+        never revisited (runaway bound: each put rolls at most one shard). A
+        shard ensured earlier in THIS call is trusted (not re-probed); a
+        pre-existing pointer is probed via ``_shard_usable`` (cached if
+        healthy). P1.5: the ``stat()`` is TOCTOU-safe — a vanish between
+        discovery and ``stat()`` recreates the (harmless, N5) empty shard
+        instead of leaking ``FileNotFoundError`` out of put (D9).
         """
         if self.mode != "sqlite_sharded":
             return 0
+        just_ensured = False
         if self._write_shard_id is None:
             shard_ids = self.list_shards()
             self._write_shard_id = max(shard_ids) if shard_ids else 1
             self.ensure_shard_exists(self._write_shard_id)
+            just_ensured = True
         current = self._write_shard_id
-        path = self.shard_path(current)
-        current_size = path.stat().st_size if path.exists() else 0
+        if not just_ensured and not self._shard_usable(current):
+            current += 1
+            self.ensure_shard_exists(current)
+            self._write_shard_id = current
+            return current
+        try:
+            current_size = self.shard_path(current).stat().st_size
+        except FileNotFoundError:
+            self.ensure_shard_exists(current)
+            current_size = 0
         if current_size + estimated_payload_bytes > self.shard_cap_bytes:
             current += 1
             self.ensure_shard_exists(current)

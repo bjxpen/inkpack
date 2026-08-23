@@ -637,7 +637,12 @@ file is missing/unusable and the caller is providing the canonical raw bytes
 (4) atomically update `encodings.shard_id` in the same transaction.
 Reencode/verify/get do not have raw bytes available for rehoming; they must
 not create shards and surface typed errors instead (reencode keeps its
-per-target skip behavior).
+per-target skip behavior). (r4-P1.2: the write-side existence probes —
+`payload_exists` and `resolve_write_shard`/`choose_shard_for_write` — treat a
+present-but-unusable shard file (corrupt header or payload page) as a MISS
+and rehome; a locked-but-healthy shard is `Busy`, never "unusable". Reads,
+verify, and `open_repo` still classify a present-but-unusable shard as
+`CorruptContent` (A2/C4) — only the write path rehomes.)
 
 **S3 — Decode output bound (spec §6.4).** For every read, `raw_len` is parsed
 from the `blob_key` and enforced as a hard bound. `zstd`: frames without a
