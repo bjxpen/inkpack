@@ -104,22 +104,27 @@ def test_null_shard_id_dedupe_put_does_not_leak_sqlite(repo_sharded):
 
 
 def test_busy_opening_shard_is_busy_not_corrupt(repo_sharded, monkeypatch):
-    import inkpack.sqlite as sqlite_mod
+    """P2.1 retarget: the write-side probe (payload_exists) now uses
+    Session.attach (ATTACH on the index connection), not connect_file for the
+    shard — so the spy patches Session.attach. A Busy from attach must
+    PROPAGATE (a locked-but-healthy shard is not a "miss"/unusable — the
+    P1.2 except-ordering trap), never be swallowed as a rehome miss."""
+    from inkpack.sqlite import Session
 
     store = repo_sharded.store
     data = b"busy-shard-probe"
-    store.put_bytes(data, "raw").result
+    ref = store.put_bytes(data, "raw").result.ref
+    sid = int(enc_row(repo_sharded, ref)["shard_id"])
+    real_attach = Session.attach
 
-    real = sqlite_mod.connect_file
-
-    def shard_only(db_path, *args, **kwargs):
-        if db_path.name.startswith("shard-"):
+    def busy_attach(self, shard_id):
+        if shard_id == sid:
             raise Busy("database is locked")
-        return real(db_path, *args, **kwargs)
+        return real_attach(self, shard_id)
 
-    monkeypatch.setattr(sqlite_mod, "connect_file", shard_only)
+    monkeypatch.setattr(Session, "attach", busy_attach)
     with pytest.raises(Busy):
-        store.put_bytes(data, "raw").result  # dedupe hit -> payload_exists -> _shard_conn
+        store.put_bytes(data, "raw").result  # dedupe hit -> payload_exists -> attach
 
 
 # ---------------------------------------------------------------------------
@@ -443,7 +448,7 @@ def test_read_shard_conn_does_not_migrate_payload(repo_sharded, monkeypatch):
     data = b"y"
     repo_sharded.store.put_bytes(data, "raw").result
     called["n"] = 0
-    repo_sharded.store.prepare_bytes(data, "raw")  # payload_exists -> _shard_conn
+    repo_sharded.store.prepare_bytes(data, "raw")  # payload_exists -> attach (no DDL)
     assert called["n"] == 0
 
 

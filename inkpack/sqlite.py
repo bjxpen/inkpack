@@ -228,7 +228,7 @@ def connect_file(
         if _is_busy(exc):
             raise Busy(str(exc)) from exc
         # Missing files (mode=rw) surface as "unable to open database file";
-        # callers classify that message (e.g. Session._shard_conn -> missing).
+        # callers classify that (e.g. Session.attach -> MissingContent).
         raise InkpackError(f"cannot open database {db_path}: {exc}") from exc
     conn.row_factory = sqlite3.Row
     # Autocommit mode: reads never leave an implicit open transaction, so a
@@ -404,6 +404,25 @@ def _payload_version(conn: sqlite3.Connection) -> int:
     return int(row[0]) if row is not None else 0
 
 
+def _payload_schema_current(conn: sqlite3.Connection) -> bool:
+    """P2.4: is the payload schema already at the latest version?
+
+    Read-only (no DDL) — checks ``sqlite_master`` for the version table and,
+    if present, reads the payload version. Lets open/validation skip
+    ``migrate_payload`` (which would run a no-op ``CREATE TABLE IF NOT
+    EXISTS`` DDL) when the schema is already current. Returns False when the
+    version table is absent (a fresh shard) so the caller migrates."""
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='_inkpack_schema'"
+    ).fetchone()
+    if row is None:
+        return False
+    row = conn.execute("SELECT version FROM _inkpack_schema WHERE key='payload'").fetchone()
+    if row is None:
+        return False
+    return int(row[0]) >= max(version for version, _script in PAYLOAD_MIGRATIONS)
+
+
 def _apply_payload_migrations(conn: sqlite3.Connection) -> None:
     """Apply pending payload migrations; the caller owns the transaction."""
     conn.execute(_PAYLOAD_VERSION_TABLE)
@@ -412,7 +431,7 @@ def _apply_payload_migrations(conn: sqlite3.Connection) -> None:
         if version <= current:
             continue
         for stmt in _split_statements(script):
-            conn.execute(stmt.format(p=""))  # Issue 43: tokenized schema
+            conn.execute(stmt.replace("{p}", ""))  # Issue 43 / P2.3: tokenized schema
         conn.execute(
             "INSERT INTO _inkpack_schema(key, version) VALUES('payload', ?) "
             "ON CONFLICT(key) DO UPDATE SET version=excluded.version",
@@ -438,10 +457,16 @@ def migrate_payload_attached(conn: sqlite3.Connection, alias: str = "p") -> None
 
     Runs inside the caller's transaction; the version table lives in the
     shard (``<alias>._inkpack_schema``), so each shard tracks its own payload
-    schema version independently of the index. DDL statements use the
-    ``{p}`` token (Issue 43) instead of string replacement. ``alias`` is the
-    ATTACH alias: ``p`` for whitebox per-txn attaches, ``p<id>`` for
-    session-managed attaches (C1).
+    schema version independently of the index. ``alias`` is the ATTACH alias:
+    ``p`` for whitebox per-txn attaches, ``p<id>`` for session-managed
+    attaches (C1).
+
+    P2.3: statements use the ``{p}`` token, substituted with a literal
+    ``str.replace`` (NOT ``str.format``) so a literal ``{`` in a future
+    script (a JSON default, a trigger body) cannot raise ``KeyError``.
+    ATTACHED migrations run in autocommit BEFORE the writer's ``BEGIN`` and
+    MUST be idempotent (``IF NOT EXISTS`` / ``ON CONFLICT``); do not move
+    them inside the write txn unless a non-idempotent migration arrives.
     """
     a = f"{alias}."
     conn.execute(
@@ -453,7 +478,7 @@ def migrate_payload_attached(conn: sqlite3.Connection, alias: str = "p") -> None
         if version <= current:
             continue
         for stmt in _split_statements(script):
-            conn.execute(stmt.format(p=a))
+            conn.execute(stmt.replace("{p}", a))
         conn.execute(
             f"INSERT INTO {a}_inkpack_schema(key, version) VALUES('payload', ?) "
             "ON CONFLICT(key) DO UPDATE SET version=excluded.version",
@@ -501,7 +526,6 @@ class Session:
     def __init__(self, backend: SqliteBackend) -> None:
         self.backend = backend
         self.conn = backend.connect_index()
-        self._shard_conns: dict[int, sqlite3.Connection] = {}
         self._missing_shards: set[int] = set()
         self._dict_cache: dict[str, bytes | None] = {}
         # A3: structural payload-schema probe cache (None = main DB). A dropped
@@ -612,53 +636,6 @@ class Session:
         row = self.query_one("SELECT value_json FROM repo_config WHERE key=?", (key,))
         return None if row is None else loads_config(str(row[0]), key=key)
 
-    def _shard_conn(self, shard_id: int) -> sqlite3.Connection | None:
-        """Open (and cache) a shard connection for READ probes (Issue 17/32).
-
-        The file's existence is checked FIRST (never parse SQLite's English
-        error text): a missing file is negative-cached and returns None
-        (missing content). Busy and other typed errors propagate unchanged
-        (Issue 3 — a locked shard is Busy, never CorruptContent). Reads never
-        migrate the shard schema (Issue 32: migrations are open/writer-only).
-        """
-        if shard_id in self._missing_shards:
-            return None
-        conn = self._shard_conns.get(shard_id)
-        if conn is not None:
-            return conn
-        shard_path = self.backend.shard_path(shard_id)
-        if not shard_path.exists():
-            self._missing_shards.add(shard_id)
-            return None
-        try:
-            conn = connect_file(shard_path, self.backend.busy_timeout_ms, self.backend.synchronous)
-        except (Busy, CorruptContent, MissingContent, NotFound):
-            raise
-        except sqlite3.Error as exc:
-            # Defense in depth: a failure raised from (or below) the connect
-            # layer that connect_file did not pre-translate is still
-            # classified here — a present-but-unusable shard is never a raw
-            # leak and never Busy unless it says so (G2(b)).
-            _classify_db_error(exc, what="shard connect", shard_id=shard_id)
-        except InkpackError as exc:
-            # connect_file pre-translates (A1): busy -> Busy, other failures ->
-            # InkpackError. A present-but-unreadable shard file is corruption.
-            raise CorruptContent(f"shard {shard_id} is present but unusable: {exc}") from exc
-        self._shard_conns[shard_id] = conn
-        return conn
-
-    def _shard_query_one(
-        self, conn: sqlite3.Connection, sql: str, params: tuple[Any, ...], *, shard_id: int | None = None
-    ) -> sqlite3.Row | None:
-        try:
-            return cast("sqlite3.Row | None", conn.execute(sql, params).fetchone())
-        except sqlite3.Error as exc:
-            # A shard that was valid at connect time but is unusable now (the
-            # file was replaced/corrupted mid-session): classify, never leak
-            # raw sqlite (A2). Recovery = a fresh session (no negative cache
-            # for present-but-unusable shards).
-            _classify_db_error(exc, what="shard read failed", shard_id=shard_id)
-
     @staticmethod
     def alias_for(shard_id: int) -> str:
         """SQL alias under which a shard is ATTACHed on a session connection.
@@ -703,11 +680,14 @@ class Session:
         """Cheap existence probe (``SELECT 1``) — never reads the whole BLOB
         (review P2-2).
 
-        WRITE-side semantics (P1.2): a present-but-unusable shard is a MISS
-        (``False``), so a put REHOMES / repairs off it instead of failing —
-        the write path tolerates junk. READS (via ``_read_snapshot``/attach)
-        still classify an unusable shard as ``CorruptContent`` (A2/C4).
-        ``Busy`` propagates either way (locked-but-healthy is not a miss).
+        WRITE-side semantics (P1.2/P2.1): a MISSING or present-but-UNUSABLE
+        shard is a MISS (``False``), so a put REHOMES / repairs off it instead
+        of failing — the write path tolerates junk. P2.1 unifies the probe
+        onto the session ATTACH (the same path reads use), so the miss/unusable
+        decision is defined once. READS (via ``_read_snapshot``/attach) still
+        classify an unusable shard as ``CorruptContent`` (A2/C4). ``Busy``
+        propagates either way (locked-but-healthy is not a miss — the
+        P1.2 except-ordering trap).
         """
         if self.backend.mode == "sqlite_single":
             row = self.query_one(
@@ -717,19 +697,18 @@ class Session:
         if shard_id is None:
             return False
         try:
-            conn = self._shard_conn(int(shard_id))
-        except CorruptContent:
-            return False  # present-but-unusable: write-side miss (rehome)
-        if conn is None:
-            return False
+            alias = self.attach(int(shard_id))
+        except (MissingContent, CorruptContent):
+            return False  # missing or present-but-unusable: write-side miss
+        # Busy propagates from attach (locked-but-healthy is not a miss).
         try:
-            row = self._shard_query_one(
-                conn,
-                "SELECT 1 FROM payload WHERE blob_key=? AND profile=?",
+            row = self.conn.execute(
+                f"SELECT 1 FROM {alias}.payload WHERE blob_key=? AND profile=?",
                 (blob_key, profile),
-                shard_id=int(shard_id),
-            )
-        except CorruptContent:
+            ).fetchone()
+        except sqlite3.Error as exc:
+            if _is_busy(exc):
+                raise Busy(str(exc)) from exc
             return False  # file became unusable mid-session: write-side miss
         return row is not None
 
@@ -747,9 +726,6 @@ class Session:
         if self._closed:
             return
         self._closed = True
-        for conn in self._shard_conns.values():
-            conn.close()
-        self._shard_conns.clear()
         self._missing_shards.clear()
         for shard_id in list(self._attached):
             with suppress(sqlite3.Error):
@@ -892,7 +868,8 @@ class SqliteBackend:
                         raise
                 else:
                     migrate_index(conn)
-                    migrate_payload(conn)
+                    if not _payload_schema_current(conn):  # P2.4: skip DDL if current
+                        migrate_payload(conn)
             finally:
                 conn.close()
         else:
@@ -993,7 +970,8 @@ class SqliteBackend:
         path = self.shard_path(sid)
         conn = connect_file(path, self.busy_timeout_ms, self.synchronous)
         try:
-            migrate_payload(conn)  # idempotent; existing shards stay current (M10)
+            if not _payload_schema_current(conn):  # P2.4: skip DDL if current (M10)
+                migrate_payload(conn)
             journal_mode = str(conn.execute("PRAGMA journal_mode").fetchone()[0]).lower()
         except sqlite3.Error as exc:
             _classify_db_error(exc, what=f"shard {sid} DB is not a valid sqlite database")

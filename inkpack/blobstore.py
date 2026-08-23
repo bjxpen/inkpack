@@ -405,6 +405,22 @@ class BlobStore:
         except ValueError as exc:
             raise CorruptContent(f"stored encoding policy unusable: {exc}") from exc
 
+    def resolve_repair_write(self, s: Session, prepared: PreparedPut, row: sqlite3.Row, raw: bytes) -> tuple[PreparedPut, Encoded]:
+        """P2.2: the prepare-side repair DECISION (no commit) — encode under
+        the stored policy, enforce the blob limit, resolve + ensure the write
+        shard (rehome off a missing/unusable shard, P1.2), and return the
+        ``(prepared, enc)`` to write. Shared by :meth:`repair_flow` and
+        ``Repository._upsert_repair`` so the decision is defined once."""
+        enc = self.encode_with_stored_policy(s, row, raw)
+        self.check_blob_limit(enc.stored_len, s.conn)
+        shard_id = self.backend.resolve_write_shard(enc.stored_len, row["shard_id"])
+        if self.backend.mode == "sqlite_sharded":
+            s.forget_missing_shard(shard_id)
+        prepared = PreparedPut(
+            prepared.blob_key, prepared.raw_len, prepared.profile, enc, shard_id
+        )
+        return prepared, enc
+
     def repair_flow(self, s: Session, prepared: PreparedPut, raw: bytes) -> PutResult:
         """Repair a missing payload using the STORED policy, rehoming to a
         writable shard when the referenced shard is missing/NULL (S2)."""
@@ -420,17 +436,19 @@ class BlobStore:
             raise MissingContent(
                 f"dictionary {row['zstd_dict_id']!r} missing for {(prepared.blob_key, prepared.profile)}"
             )
-        enc = self.encode_with_stored_policy(s, row, raw)
-        self.check_blob_limit(enc.stored_len, s.conn)
-        shard_id = self.backend.resolve_write_shard(enc.stored_len, row["shard_id"])
-        if self.backend.mode == "sqlite_sharded":
-            s.forget_missing_shard(shard_id)
+        prepared, enc = self.resolve_repair_write(s, prepared, row, raw)  # P2.2
         now = self.backend.now()
-        alias = s.alias_for(shard_id) if self.backend.mode == "sqlite_sharded" else "p"
+        if self.backend.mode == "sqlite_sharded":
+            assert prepared.shard_id is not None  # resolve_repair_write set a concrete shard
+            alias = s.alias_for(prepared.shard_id)
+            attach = prepared.shard_id
+        else:
+            alias = "p"
+            attach = None
         with self.backend.txn_on(
             s.conn,
             write=True,
-            attach_shard_id=shard_id if self.backend.mode == "sqlite_sharded" else None,
+            attach_shard_id=attach,
             session=s,
         ) as conn:
             self.backend.store_encoding_and_payload_on(
@@ -444,7 +462,7 @@ class BlobStore:
                 zstd_dict_id=enc.zstd_dict_id,
                 stored_len=enc.stored_len,
                 checksum=None,
-                shard_id=shard_id,
+                shard_id=prepared.shard_id,
                 updated_at=now,
                 payload=enc.data,
                 alias=alias,

@@ -384,19 +384,12 @@ class Repository:
                 f"encoding for {(prepared.blob_key, prepared.profile)} vanished "
                 "between prepare and persist; retry"
             ) from None
-        enc = self.store.encode_with_stored_policy(s, row, raw)
-        self.store.check_blob_limit(enc.stored_len, s.conn)
-        shard_id = backend.resolve_write_shard(enc.stored_len, row["shard_id"])
-        if backend.mode == "sqlite_sharded":
-            s.forget_missing_shard(shard_id)
-        prepared = PreparedPut(
-            prepared.blob_key, prepared.raw_len, prepared.profile, enc, shard_id
-        )
+        prepared, enc = self.store.resolve_repair_write(s, prepared, row, raw)  # P2.2
         with backend.txn_on(
             s.conn,
             write=True,
-            # shard_id is always a resolved int here (resolve_write_shard).
-            attach_shard_id=shard_id if backend.mode == "sqlite_sharded" else None,
+            # prepared.shard_id is a concrete int here (resolve_repair_write).
+            attach_shard_id=prepared.shard_id if backend.mode == "sqlite_sharded" else None,
             session=s,
         ) as conn:
             backend.store_encoding_and_payload_on(
@@ -410,10 +403,10 @@ class Repository:
                 zstd_dict_id=enc.zstd_dict_id,
                 stored_len=enc.stored_len,
                 checksum=None,
-                shard_id=shard_id,
+                shard_id=prepared.shard_id,
                 updated_at=now,
                 payload=enc.data,
-                alias=self._shard_alias(s, shard_id),
+                alias=self._shard_alias(s, prepared.shard_id),
             )
             return self._catalog_upsert(conn, novel_id, order_key, prepared, hints, meta, now)
 

@@ -50,7 +50,7 @@ from inkpack import (
 )
 from inkpack.blobstore import BlobStore
 from inkpack.codec import IKB1, parse_blob_key_ikb1
-from inkpack.sqlite import Session, SqliteBackend, connect_file
+from inkpack.sqlite import SqliteBackend, connect_file
 from inkpack.types import Operation, OpEvent
 
 from .conftest import assert_repo_consistent, enc_row, make_profiles, payload_bytes
@@ -86,22 +86,6 @@ def test_h1_get_bytes_reads_inside_a_transaction(repo, monkeypatch):
     monkeypatch.setattr(sqlite3, "connect", factory_connect)
     assert repo.store.get_bytes(ref) == b"body" * 20
     assert begins, "get_bytes must BEGIN a snapshot before reading encodings+payload"
-
-
-def test_h1_get_bytes_does_not_open_a_second_shard_connection(repo, monkeypatch):
-    if repo.backend.mode != "sqlite_sharded":
-        pytest.skip("single-file uses one connection; H1 there is the missing BEGIN")
-    ref = repo.store.put_bytes(b"body" * 20, "raw").result.ref
-    calls = {"n": 0}
-    real = Session._shard_conn
-
-    def counting(self, shard_id):
-        calls["n"] += 1
-        return real(self, shard_id)
-
-    monkeypatch.setattr(Session, "_shard_conn", counting)
-    assert repo.store.get_bytes(ref) == b"body" * 20
-    assert calls["n"] == 0, "payload must come from ATTACH on the index txn, not _shard_conn"
 
 
 def test_h1_stale_row_plus_new_payload_is_not_a_public_success(repo):

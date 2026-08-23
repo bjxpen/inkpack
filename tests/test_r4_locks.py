@@ -235,18 +235,17 @@ def test_get_bytes_on_unusable_shard_still_corruptcontent(repo_sharded):
 def test_busy_shard_not_treated_unusable(repo_sharded, monkeypatch):
     """[PIN] the except-ordering trap: a LOCKED (Busy) shard must raise Busy,
     not be silently rolled off as "unusable". Busy subclasses InkpackError,
-    so a broad catch before the Busy catch would swallow it."""
-    import inkpack.sqlite as sqlite_mod
+    so a broad catch before the Busy catch would swallow it. P2.1: the
+    write-side probe uses Session.attach (not connect_file for the shard), so
+    the spy patches Session.attach."""
+    from inkpack.sqlite import Session
 
     repo_sharded.store.put_bytes(b"busy-stay" * 50, "raw").result
-    real = sqlite_mod.connect_file
 
-    def shard_busy(db_path, *a, **k):
-        if db_path.name.startswith("shard-"):
-            raise Busy("database is locked")
-        return real(db_path, *a, **k)
+    def busy_attach(self, shard_id):
+        raise Busy("database is locked")
 
-    monkeypatch.setattr(sqlite_mod, "connect_file", shard_busy)
+    monkeypatch.setattr(Session, "attach", busy_attach)
     with pytest.raises(Busy):
         repo_sharded.store.put_bytes(b"busy-stay" * 50, "raw").result
 
@@ -445,3 +444,105 @@ def test_codec_engine_concurrent_encode_roundtrip(repo):
     for t in threads:
         t.join()
     assert errors == []
+
+
+# ---------------------------------------------------------------------------
+# P2.3 [PIN] — payload migrations are {p}-token-safe (str.replace, not
+# str.format) and idempotent
+# ---------------------------------------------------------------------------
+
+
+def test_payload_migrations_are_format_safe_and_idempotent():
+    """[PIN] a literal ``{`` in a future migration script (JSON default,
+    trigger body) must not raise KeyError — the ``{p}`` token is substituted
+    with ``str.replace``, and every statement is idempotent (IF NOT EXISTS /
+    ON CONFLICT) since attached migrations run in autocommit."""
+    import sqlite3
+
+    from inkpack import sqlite as sm
+
+    for _v, script in sm.PAYLOAD_MIGRATIONS:
+        stripped = script.replace("{p}", "")
+        assert "{" not in stripped and "}" not in stripped
+        for stmt in sm._split_statements(script.replace("{p}", "p.")):
+            assert sqlite3.complete_statement(stmt)
+            u = stmt.upper()
+            assert "IF NOT EXISTS" in u or "ON CONFLICT" in u
+
+
+# ---------------------------------------------------------------------------
+# P2.4 [FAIL-FIRST] — open skips payload DDL when the schema is already
+# current
+# ---------------------------------------------------------------------------
+
+
+def test_open_skips_payload_migrate_when_already_current(tmp_path, monkeypatch):
+    """[FAIL-FIRST] open/validation ran a no-op payload DDL (CREATE TABLE IF
+    NOT EXISTS _inkpack_schema + version SELECT) on every open even when the
+    schema was already current. P2.4 reads the version first (read-only) and
+    skips migrate_payload when current. TODAY: >=1 migrate_payload call per
+    open (per shard in sharded mode)."""
+    from inkpack import create_repo, open_repo
+    from inkpack import sqlite as sm
+
+    called = {"n": 0}
+    real = sm.migrate_payload
+
+    def wrapped(conn):
+        called["n"] += 1
+        return real(conn)
+
+    monkeypatch.setattr(sm, "migrate_payload", wrapped)
+    for mode in ("sqlite_single", "sqlite_sharded"):
+        root = tmp_path / mode
+        create_repo(root, mode, profiles=PROFILES)
+        called["n"] = 0
+        open_repo(root)
+        assert called["n"] == 0, mode
+
+
+# ---------------------------------------------------------------------------
+# P2.2 [PIN] — the repair DECISION (encode + limit + resolve + forget) is
+# defined once, shared by repair_flow and Repository._upsert_repair
+# ---------------------------------------------------------------------------
+
+
+def test_repair_decision_is_shared_not_duplicated():
+    """[PIN] P2.2 extracted the prepare-side repair decision into
+    BlobStore.resolve_repair_write so repair_flow (put-repair) and
+    Repository._upsert_repair (upsert-repair) cannot diverge. Pin that both
+    call sites route through the shared helper (and neither inlines
+    resolve_write_shard + forget_missing_shard themselves)."""
+    import inspect
+
+    from inkpack.blobstore import BlobStore
+    from inkpack.repo import Repository
+
+    assert hasattr(BlobStore, "resolve_repair_write")
+    repair_flow_src = inspect.getsource(BlobStore.repair_flow)
+    upsert_repair_src = inspect.getsource(Repository._upsert_repair)
+    assert "resolve_repair_write" in repair_flow_src
+    assert "resolve_repair_write" in upsert_repair_src
+    # Neither caller inlines the resolve/forget decision itself.
+    assert "resolve_write_shard" not in repair_flow_src
+    assert "resolve_write_shard" not in upsert_repair_src
+    assert "forget_missing_shard" not in repair_flow_src
+    assert "forget_missing_shard" not in upsert_repair_src
+
+
+# ---------------------------------------------------------------------------
+# P2.1 [FAIL-FIRST] — the write-side probe uses the session ATTACH (one
+# connection), not a per-shard connection
+# ---------------------------------------------------------------------------
+
+
+def test_sharded_dedupe_hit_put_opens_one_connection(repo_sharded, connect_counter):
+    """[FAIL-FIRST] P2.1 unified the write-side existence probe onto the
+    session ATTACH, so a sharded dedupe-hit put opens ONE connection (the
+    session), not two (session + a per-shard probe connection). TODAY
+    (pre-P2.1, probe via a per-shard connection): 2."""
+    data = b"one-conn-hit" * 20
+    repo_sharded.store.put_bytes(data, "raw").result  # warms the blob-limit cache
+    connect_counter["opens"] = 0
+    repo_sharded.store.put_bytes(data, "raw").result
+    assert connect_counter["opens"] == 1
