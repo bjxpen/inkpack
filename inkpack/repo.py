@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import io
 import sqlite3
 import tempfile
@@ -355,6 +356,67 @@ class Repository:
         failpoint("upsert.pre_commit")  # inside the unified txn, pre-commit
         return chapter_id
 
+    def _upsert_repair(
+        self,
+        s: Session,
+        novel_id: int,
+        order_key: str,
+        prepared: PreparedPut,
+        raw: bytes,
+        hints: dict[str, Any] | None,
+        meta: dict[str, Any] | None,
+        now: str,
+    ) -> int:
+        """B3: fold a repair INTO the catalog transaction. Re-fetch the row
+        (it may have moved), encode under the STORED policy, rehome when the
+        referenced shard is missing/NULL, then write content + catalog in ONE
+        commit — a chapter never commits pointing at missing content, and no
+        failure can leave a repaired payload without its catalog row."""
+        backend = self.backend
+        row = s.query_one(
+            "SELECT * FROM encodings WHERE blob_key=? AND profile=?",
+            (prepared.blob_key, prepared.profile),
+        )
+        if row is None:
+            # The encoding vanished under us (concurrent gc): transient
+            # contention, safe to retry the upsert (A6/B3).
+            raise Retryable(
+                f"encoding for {(prepared.blob_key, prepared.profile)} vanished "
+                "between prepare and persist; retry"
+            ) from None
+        enc = self.store.encode_with_stored_policy(s, row, raw)
+        self.store.check_blob_limit(enc.stored_len, s.conn)
+        shard_id = backend.resolve_write_shard(enc.stored_len, row["shard_id"])
+        if backend.mode == "sqlite_sharded":
+            s.forget_missing_shard(shard_id)
+        prepared = PreparedPut(
+            prepared.blob_key, prepared.raw_len, prepared.profile, enc, shard_id
+        )
+        with backend.txn_on(
+            s.conn,
+            write=True,
+            # shard_id is always a resolved int here (resolve_write_shard).
+            attach_shard_id=shard_id if backend.mode == "sqlite_sharded" else None,
+            session=s,
+        ) as conn:
+            backend.store_encoding_and_payload_on(
+                conn,
+                blob_key=prepared.blob_key,
+                raw_len=prepared.raw_len,
+                created_at=now,
+                profile=prepared.profile,
+                codec=enc.codec,
+                codec_params_json=enc.codec_params_json,
+                zstd_dict_id=enc.zstd_dict_id,
+                stored_len=enc.stored_len,
+                checksum=None,
+                shard_id=shard_id,
+                updated_at=now,
+                payload=enc.data,
+                alias=self._shard_alias(s, shard_id),
+            )
+            return self._catalog_upsert(conn, novel_id, order_key, prepared, hints, meta, now)
+
     def _upsert_prepared(
         self,
         s: Session,
@@ -373,11 +435,20 @@ class Repository:
         transaction (B3): a chapter never commits pointing at missing
         content, and no failure can leave a repaired payload without its
         catalog row (or vice versa).
+
+        The dedupe-hit path mirrors ``_persist``'s peek/attach/compare
+        retry loop (P1.3): if the shard locator moved between the peek and
+        the in-txn re-read, re-attach the new shard and retry (budget 2);
+        exhaustion is ``Retryable`` (A6). The row's (possibly moved) locator
+        is folded into ``prepared`` so the ``persist_prepared``
+        schema/alias pair is coherent.
         """
         backend = self.backend
         now = backend.now()
         shard_id: int | None = None
         if prepared.enc is not None:
+            # New write or an explicit repair: single write, no locator-move
+            # retry (the payload is being written, not probed).
             self.store.check_blob_limit(prepared.enc.stored_len, s.conn)
             shard_id = backend.resolve_write_shard(prepared.enc.stored_len, prepared.shard_id)
             if backend.mode == "sqlite_sharded":
@@ -385,74 +456,72 @@ class Repository:
             prepared = PreparedPut(
                 prepared.blob_key, prepared.raw_len, prepared.profile, prepared.enc, shard_id
             )
-        else:
-            peek = s.query_one(
-                "SELECT shard_id FROM encodings WHERE blob_key=? AND profile=?",
-                (prepared.blob_key, prepared.profile),
-            )
-            if peek is not None and backend.mode == "sqlite_sharded" and peek["shard_id"] is not None:
-                shard_id = int(peek["shard_id"])
-        try:
             with backend.txn_on(
                 s.conn,
                 write=True,
-                attach_shard_id=shard_id if (backend.mode == "sqlite_sharded" and shard_id is not None) else None,
+                # resolve_write_shard always returns a concrete int here.
+                attach_shard_id=shard_id if backend.mode == "sqlite_sharded" else None,
                 session=s,
             ) as conn:
                 self.store.persist_prepared(
                     conn, s, prepared, raw, now, alias=self._shard_alias(s, shard_id)
                 )
                 return self._catalog_upsert(conn, novel_id, order_key, prepared, hints, meta, now)
-        except _RepairRequired:
-            if raw is None:
-                raise
-            # B3: fold the repair INTO the catalog transaction. Re-fetch the
-            # row (it may have moved), encode under the STORED policy, rehome
-            # when the referenced shard is missing/NULL, then write content +
-            # catalog in one commit.
-            row = s.query_one(
-                "SELECT * FROM encodings WHERE blob_key=? AND profile=?",
+        # Dedupe-hit path: peek/attach/compare retry loop (P1.3).
+        for _attempt in range(2):
+            peek = s.query_one(
+                "SELECT shard_id FROM encodings WHERE blob_key=? AND profile=?",
                 (prepared.blob_key, prepared.profile),
             )
-            if row is None:
-                # The encoding vanished under us (concurrent gc): transient
-                # contention, safe to retry the upsert (A6/B3).
+            if peek is None:
+                # Row vanished before we attached: transient contention.
                 raise Retryable(
                     f"encoding for {(prepared.blob_key, prepared.profile)} vanished "
                     "between prepare and persist; retry"
                 ) from None
-            enc = self.store.encode_with_stored_policy(s, row, raw)
-            self.store.check_blob_limit(enc.stored_len, s.conn)
-            shard_id = backend.resolve_write_shard(enc.stored_len, row["shard_id"])
-            if backend.mode == "sqlite_sharded":
-                s.forget_missing_shard(shard_id)
-            prepared = PreparedPut(
-                prepared.blob_key, prepared.raw_len, prepared.profile, enc, shard_id
+            shard_id = (
+                int(peek["shard_id"])
+                if (backend.mode == "sqlite_sharded" and peek["shard_id"] is not None)
+                else None
             )
-            with backend.txn_on(
-                s.conn,
-                write=True,
-                # shard_id is always a resolved int here (resolve_write_shard).
-                attach_shard_id=shard_id if backend.mode == "sqlite_sharded" else None,
-                session=s,
-            ) as conn:
-                backend.store_encoding_and_payload_on(
-                    conn,
-                    blob_key=prepared.blob_key,
-                    raw_len=prepared.raw_len,
-                    created_at=now,
-                    profile=prepared.profile,
-                    codec=enc.codec,
-                    codec_params_json=enc.codec_params_json,
-                    zstd_dict_id=enc.zstd_dict_id,
-                    stored_len=enc.stored_len,
-                    checksum=None,
-                    shard_id=shard_id,
-                    updated_at=now,
-                    payload=enc.data,
-                    alias=self._shard_alias(s, shard_id),
-                )
-                return self._catalog_upsert(conn, novel_id, order_key, prepared, hints, meta, now)
+            try:
+                with backend.txn_on(
+                    s.conn,
+                    write=True,
+                    attach_shard_id=shard_id
+                    if (backend.mode == "sqlite_sharded" and shard_id is not None)
+                    else None,
+                    session=s,
+                ) as conn:
+                    row = conn.execute(
+                        "SELECT shard_id FROM encodings WHERE blob_key=? AND profile=?",
+                        (prepared.blob_key, prepared.profile),
+                    ).fetchone()
+                    if row is None:
+                        continue  # row vanished mid-txn: retry
+                    if backend.mode == "sqlite_sharded" and row["shard_id"] != peek["shard_id"]:
+                        continue  # P1.3: locator moved: re-attach + retry
+                    # P1.3 coherence: fold the row's (possibly moved) locator
+                    # into prepared so persist_prepared's schema/alias pair is
+                    # coherent instead of relying on the _schema_ok cache.
+                    if backend.mode == "sqlite_sharded" and row["shard_id"] is not None:
+                        prepared = dataclasses.replace(prepared, shard_id=int(row["shard_id"]))
+                    self.store.persist_prepared(
+                        conn,
+                        s,
+                        prepared,
+                        raw,
+                        now,
+                        alias=self._shard_alias(s, row["shard_id"] if backend.mode == "sqlite_sharded" else None),
+                    )
+                    return self._catalog_upsert(conn, novel_id, order_key, prepared, hints, meta, now)
+            except _RepairRequired:
+                if raw is None:
+                    raise  # P1.3: content exists (elsewhere); nothing to repair from
+                return self._upsert_repair(s, novel_id, order_key, prepared, raw, hints, meta, now)
+        raise Retryable(
+            f"shard locator for {(prepared.blob_key, prepared.profile)} changed repeatedly; retry"
+        )
 
     def _chapter_ref(self, chapter_id: int) -> ContentRef:
         row = self.backend.get_chapter(self._require_pk_public(chapter_id, "chapter_id"))

@@ -16,6 +16,7 @@ import shutil
 import time
 import uuid
 import warnings
+from contextlib import suppress
 from pathlib import Path
 from typing import Any, cast
 
@@ -203,8 +204,12 @@ def create_repo(
     except BaseException:
         shutil.rmtree(tmp, ignore_errors=True)
         raise
+    # P1.4: remember whether the destination is a pre-existing (empty) dir,
+    # so a rename failure can best-effort restore it (we rmdir it below, and
+    # os.replace onto a dir is not portable — Issue 13).
+    dest_existed_empty = root.exists()
     try:
-        if root.exists():
+        if dest_existed_empty:
             root.rmdir()  # empty only (Issue 13: os.replace onto a dir is not portable)
         os.replace(tmp, root)  # atomic; root absent or an empty dir
         backend.root = root
@@ -213,6 +218,12 @@ def create_repo(
             backend.payload_dir = root / "payload"
     except OSError as exc:
         shutil.rmtree(tmp, ignore_errors=True)
+        if dest_existed_empty:
+            # P1.4: best-effort restore the (empty) destination dir we rmdir'd.
+            # A race-created file/dir makes mkdir fail — that must NOT mask
+            # the original error.
+            with suppress(OSError):
+                root.mkdir()
         raise InkpackError(f"cannot create repository at {root}: {exc}") from exc
     return _build_repository(backend, identity=identity, codec=codec)
 
@@ -293,14 +304,20 @@ def _load_repo_config(
     cap = backend.config_get("shard_cap_bytes")
     minimum = backend.config_get("shard_min_bytes")
     if backend.mode == "sqlite_sharded":
-        if cap is not None:
-            if isinstance(cap, bool) or not isinstance(cap, int) or cap <= 0:
-                raise InkpackError(f"invalid repo config: shard_cap_bytes must be a positive int, got {cap!r}")
-            backend.shard_cap_bytes = cap
-        if minimum is not None:
-            if isinstance(minimum, bool) or not isinstance(minimum, int) or minimum <= 0:
-                raise InkpackError(f"invalid repo config: shard_min_bytes must be a positive int, got {minimum!r}")
-            backend.shard_min_bytes = minimum
+        # P1.6: both cap keys are REQUIRED in sharded mode (present and valid)
+        # — a missing key is silent tampering (the factory would otherwise
+        # fall back to a 2 GiB default). Every repo create_repo writes has
+        # both, so this is safe; a partial deletion also raises.
+        if cap is None:
+            raise InkpackError(f"invalid repo config: shard_cap_bytes missing at {root}")
+        if minimum is None:
+            raise InkpackError(f"invalid repo config: shard_min_bytes missing at {root}")
+        if isinstance(cap, bool) or not isinstance(cap, int) or cap <= 0:
+            raise InkpackError(f"invalid repo config: shard_cap_bytes must be a positive int, got {cap!r}")
+        if isinstance(minimum, bool) or not isinstance(minimum, int) or minimum <= 0:
+            raise InkpackError(f"invalid repo config: shard_min_bytes must be a positive int, got {minimum!r}")
+        backend.shard_cap_bytes = cap
+        backend.shard_min_bytes = minimum
         if backend.shard_min_bytes > backend.shard_cap_bytes:
             raise InkpackError(
                 f"invalid repo config: shard_min_bytes ({backend.shard_min_bytes}) exceeds "

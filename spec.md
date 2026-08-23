@@ -724,8 +724,10 @@ boundary.
 **D8 — Strict open-time config.** `open_repo` validates `identity_policy`,
 `backend_mode`, profiles (missing → `InkpackError("…profiles missing…")`),
 `verify_on_read` (`bool` or missing → `False`), and shard ints (`int` not
-`bool`, `min ≤ cap`). A broken layout (`index.sqlite` without `payload/`) is
-`InkpackError`, never `NotFound`.
+`bool`, `min ≤ cap`). In `sqlite_sharded` mode both `shard_cap_bytes` and
+`shard_min_bytes` are **present and valid** (r4-P1.6) — a missing cap key is
+`InkpackError`, not a silent factory default. A broken layout
+(`index.sqlite` without `payload/`) is `InkpackError`, never `NotFound`.
 
 **D9 — Typed errors.** No raw `json.JSONDecodeError` / `sqlite3.Error` out of
 public or factory paths. Busy/locked → `Busy` (including open/migrate/

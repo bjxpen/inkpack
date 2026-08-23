@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import threading
 from collections import OrderedDict
 from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
@@ -256,6 +257,11 @@ class CodecEngine:
     def __init__(self) -> None:
         self._compressors: OrderedDict[tuple[int, str | None], _zstd.ZstdCompressor] = OrderedDict()
         self._decompressors: OrderedDict[tuple[str | None], _zstd.ZstdDecompressor] = OrderedDict()
+        # P1.7: the context cache is process-wide and lock-protected —
+        # independent operations on different threads may share one engine.
+        # The lock covers BOTH the get-or-create AND the cache-hit
+        # move_to_end (the hit path mutates LRU order too).
+        self._cache_lock = threading.Lock()
 
     # -- context cache (C2) ---------------------------------------------------
 
@@ -272,15 +278,16 @@ class CodecEngine:
             dict_data_eager = _zstd.ZstdCompressionDict(dict_bytes)
             return _zstd.ZstdCompressor(level=level, dict_data=dict_data_eager)
         key = (level, dict_cache_key)
-        compressor = self._compressors.get(key)
-        if compressor is None:
-            dict_data = _zstd.ZstdCompressionDict(dict_bytes) if dict_bytes is not None else None
-            compressor = _zstd.ZstdCompressor(level=level, dict_data=dict_data)
-            self._compressors[key] = compressor
-            while len(self._compressors) > self._CONTEXT_CACHE_MAX:
-                self._compressors.popitem(last=False)
-        else:
-            self._compressors.move_to_end(key)
+        with self._cache_lock:  # P1.7: covers get-or-create AND hit move_to_end
+            compressor = self._compressors.get(key)
+            if compressor is None:
+                dict_data = _zstd.ZstdCompressionDict(dict_bytes) if dict_bytes is not None else None
+                compressor = _zstd.ZstdCompressor(level=level, dict_data=dict_data)
+                self._compressors[key] = compressor
+                while len(self._compressors) > self._CONTEXT_CACHE_MAX:
+                    self._compressors.popitem(last=False)
+            else:
+                self._compressors.move_to_end(key)
         return compressor
 
     def _decompressor(self, dict_bytes: bytes | None, dict_cache_key: str | None) -> _zstd.ZstdDecompressor:
@@ -288,15 +295,16 @@ class CodecEngine:
             dict_data_eager = _zstd.ZstdCompressionDict(dict_bytes)
             return _zstd.ZstdDecompressor(dict_data=dict_data_eager)
         key = (dict_cache_key,)
-        decompressor = self._decompressors.get(key)
-        if decompressor is None:
-            dict_data = _zstd.ZstdCompressionDict(dict_bytes) if dict_bytes is not None else None
-            decompressor = _zstd.ZstdDecompressor(dict_data=dict_data)
-            self._decompressors[key] = decompressor
-            while len(self._decompressors) > self._CONTEXT_CACHE_MAX:
-                self._decompressors.popitem(last=False)
-        else:
-            self._decompressors.move_to_end(key)
+        with self._cache_lock:  # P1.7: covers get-or-create AND hit move_to_end
+            decompressor = self._decompressors.get(key)
+            if decompressor is None:
+                dict_data = _zstd.ZstdCompressionDict(dict_bytes) if dict_bytes is not None else None
+                decompressor = _zstd.ZstdDecompressor(dict_data=dict_data)
+                self._decompressors[key] = decompressor
+                while len(self._decompressors) > self._CONTEXT_CACHE_MAX:
+                    self._decompressors.popitem(last=False)
+            else:
+                self._decompressors.move_to_end(key)
         return decompressor
 
     def encode(
