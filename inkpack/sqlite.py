@@ -304,6 +304,23 @@ def _require_positive_int(value: Any, label: str) -> int:
     return value
 
 
+def _require_dict_row(conn: sqlite3.Connection, dict_id: str | None, *, what: str) -> None:
+    """N7 (r4-P1.1): a committed encoding/hit must name a dict that EXISTS.
+
+    Probes the ``dicts`` table ON THE GIVEN CONNECTION (the write-txn
+    connection), not the session's dict cache — the cache is filled during
+    prepare, before the write txn, and ``delete_unreferenced_dicts`` does not
+    invalidate it. Probing inside the same writer lock closes the window: a
+    concurrent gc that deletes the dict holds the lock, so either it ran
+    before this txn (probe sees it gone -> :class:`MissingContent`) or after
+    (the dict is still present at commit).
+    """
+    if dict_id is None:
+        return
+    if conn.execute("SELECT 1 FROM dicts WHERE dict_id=?", (dict_id,)).fetchone() is None:
+        raise MissingContent(f"dictionary {dict_id!r} missing for {what}")
+
+
 def _require_scope(scope: Any) -> int | None:
     """Runtime validation of the ``iter_live_content`` scope argument
     (Issue 15: non-negative int, not bool)."""
@@ -1217,7 +1234,15 @@ class SqliteBackend:
         ``encodings.stored_len == len(payload.data)`` and the triple can never
         be half-committed. ``alias`` is the shard's ATTACH alias: ``p`` for
         whitebox per-txn attaches, ``p<id>`` for session-managed ones (C1).
+
+        N7 (r4-P1.1): the encoding must not name a dictionary that no longer
+        exists — the dicts row is re-probed ON THIS CONNECTION (not the
+        session's dict cache) inside the same writer lock, so a concurrent
+        gc that deleted the dict cannot slip between check and commit.
         """
+        _require_dict_row(
+            conn, zstd_dict_id, what=f"the new encoding for {(blob_key, profile)}"
+        )
         self._ensure_blob(conn, blob_key, raw_len, created_at)
         if self.mode == "sqlite_single":
             conn.execute(

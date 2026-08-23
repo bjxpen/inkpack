@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import pytest
 
-from inkpack import Profile
+from inkpack import MissingContent, Profile
+
+from .conftest import delete_dict, enc_row, payload_bytes  # noqa: F401  (payload_bytes: later PRs)
 
 PROFILES = {
     "raw": Profile("raw", "none", {}),
@@ -126,3 +128,64 @@ def test_create_repo_explicit_min_still_enforced(tmp_path):
             shard_cap_bytes=1 << 20,
             min_shard_cap_bytes=1 << 25,
         )
+
+
+# ---------------------------------------------------------------------------
+# P1.1 [FAIL-FIRST x2] — N7: put must not commit an encoding whose dict is
+# already gone (in-txn dict probe at the commit point)
+# ---------------------------------------------------------------------------
+
+
+def _count(repo, table: str) -> int:
+    with repo.backend.txn(write=False) as conn:
+        return int(conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+
+
+def test_n7_new_write_does_not_commit_if_dict_vanished_after_prepare(repo, monkeypatch):
+    """[FAIL-FIRST] prepare loaded D into the session cache; the last profile
+    pin is dropped and gc deletes D; the WRITE path must re-probe the dicts
+    table on the commit connection and fail (TODAY: PutResult returned,
+    leaving an encoding that names a missing dict)."""
+    train = repo.store.train_dict([b"n7-new " * 80] * 6).result
+    repo.set_profile(Profile("zstd_d", "zstd", {"level": 6}, train.dict_id))
+    data = b"n7-new-body " * 200
+    real = repo.store._persist
+
+    def drop_pin_then_gc(s, prepared, raw):
+        repo.set_profile(Profile("zstd_d", "zstd", {"level": 6}))  # drop the pin
+        repo.store.gc(live=[]).result  # D now unreferenced -> deleted
+        return real(s, prepared, raw)
+
+    monkeypatch.setattr(repo.store, "_persist", drop_pin_then_gc)
+    encodings_before = _count(repo, "encodings")
+    with pytest.raises(MissingContent):  # TODAY: PutResult returned
+        repo.store.put_bytes(data, "zstd_d").result
+    assert _count(repo, "encodings") == encodings_before
+
+
+def test_n7_hit_rechecks_dict_in_the_write_txn(repo, monkeypatch):
+    """[FAIL-FIRST] poison the cache the way the race actually does: delete
+    the dict row AFTER a positive fetch, so THIS session's cache stays
+    positive. The hit branch must probe the dicts table on the write-txn
+    connection (TODAY: succeeds via the poisoned cache)."""
+    from inkpack.sqlite import Session
+
+    train = repo.store.train_dict([b"n7-hit " * 80] * 6).result
+    repo.set_profile(Profile("zstd_d", "zstd", {"level": 6}, train.dict_id))
+    data = b"n7-hit-body " * 200
+    first = repo.store.put_bytes(data, "zstd_d").result
+
+    orig = Session.dict_bytes
+    fired = {"n": 0}
+
+    def poison(self, dict_id):
+        result = orig(self, dict_id)
+        if dict_id == train.dict_id and result is not None and fired["n"] == 0:
+            fired["n"] += 1
+            delete_dict(repo, train.dict_id)  # DB row gone; cache stays positive
+        return result
+
+    monkeypatch.setattr(Session, "dict_bytes", poison)
+    with pytest.raises(MissingContent):  # TODAY: succeeds via the poisoned cache
+        repo.store.put_bytes(data, "zstd_d").result
+    assert enc_row(repo, first.ref) is not None  # hit must not rewrite

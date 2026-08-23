@@ -773,6 +773,11 @@ A4: "readable" also includes stored-metadata consistency — the hit probe
 rejects undecodable stored metadata, e.g. `codec` ≠ `zstd` carrying a
 `zstd_dict_id`, exactly as decode does; the hit probe is symmetric with
 decode). A present-but-corrupt payload is NOT decoded on the dedupe-hit path.
+(r4-P1.1: the dict-existence check runs ON THE COMMIT CONNECTION, inside the
+write txn's writer lock — `store_encoding_and_payload_on` and the
+`persist_prepared` hit branch probe `dicts` directly, not the session's
+dict cache, so a concurrent `gc` cannot delete the dict between check and
+commit.)
 
 **N8 — GC computes `temp_dead` freshly PER BATCH inside that batch's
 exclusive writer window (see the G amendment); a racing writer blocks on the

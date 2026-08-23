@@ -30,7 +30,7 @@ from .codec import (
     validate_train_dict_options,
 )
 from .failpoints import failpoint
-from .sqlite import Session, SqliteBackend
+from .sqlite import Session, SqliteBackend, _require_dict_row  # pyright: ignore[reportPrivateUsage]
 from .types import (
     Busy,
     Cancelled,
@@ -349,10 +349,13 @@ class BlobStore:
         # A4: a hit must only succeed when the stored metadata is decodable —
         # the same rule the read path enforces (N7 symmetry).
         self._check_stored_codec_dict(row, ref)
-        if row["zstd_dict_id"] is not None and s.dict_bytes(str(row["zstd_dict_id"])) is None:
-            raise MissingContent(
-                f"dictionary {row['zstd_dict_id']!r} missing for {(prepared.blob_key, prepared.profile)}"
-            )
+        # N7 (r4-P1.1): probe the dicts table ON THIS CONNECTION (the
+        # write-txn connection), not the session cache — a concurrent gc can
+        # delete the dict after prepare filled the cache. Probing in the same
+        # writer lock closes the window.
+        _require_dict_row(
+            conn, row["zstd_dict_id"], what=f"{(prepared.blob_key, prepared.profile)}"
+        )
         if self.backend.mode == "sqlite_sharded":
             if prepared.shard_id is None:
                 # A NULL locator cannot be probed: the payload is missing.
