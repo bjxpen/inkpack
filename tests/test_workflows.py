@@ -206,10 +206,16 @@ def test_per_novel_dictionaries(repo):
     assert size_b_with_b < size_b_with_a, "novel B's dict must compress B prose best"
 
     # Everything still round-trips, and decoding uses the stored dict id.
+    # (The ref→body mapping goes through the identity, not iteration order:
+    # C3 made iter_live_content paged with a global (blob_key, profile) order.)
     assert repo.store.get_bytes(ref_a_probe) == probe_a
     assert repo.store.get_bytes(ref_b_probe) == probe_b
-    for ref, body in zip(refs_a + refs_b, chapters_a + chapters_b, strict=True):
-        assert repo.store.get_bytes(ref) == body
+    body_by_key = {
+        repo.store.identity.key_bytes(body)[0]: body
+        for body in chapters_a + chapters_b
+    }
+    for ref in refs_a + refs_b:
+        assert repo.store.get_bytes(ref) == body_by_key[ref.blob_key]
     verify = repo.store.verify().result
     assert verify.checked == verify.ok
     assert_repo_consistent(repo)
@@ -249,10 +255,10 @@ def test_random_chapter_replacement_and_removal(repo):
             assert replaced == chapter_id
             current[chapter_id] = body
         elif op < 8:
-            # Remove a chapter (no public delete API; remove the row directly).
+            # Remove a chapter (catalog-only; its content is reclaimed by the
+            # GC below).
             chapter_id = rng.choice(list(current))
-            with repo.backend.txn(write=True) as conn:
-                conn.execute("DELETE FROM chapters WHERE id=?", (chapter_id,))
+            repo.delete_chapter(chapter_id)
             del current[chapter_id]
         else:
             # Read back a random chapter and verify byte fidelity.

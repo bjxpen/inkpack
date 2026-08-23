@@ -115,6 +115,33 @@ def test_cancel_gc_mid_run_keeps_consistency(repo):
     assert gc.encodings_deleted == 5
 
 
+def test_compact_cancel_between_targets(repo_sharded, monkeypatch):
+    """G4: cancellation between compact targets — the index is vacuumed
+    first, then a cancel before the first shard leaves every shard untouched
+    (the index VACUUM is idempotent and the repo stays consistent)."""
+    # Two shards so there are multiple targets after the index.
+    repo_sharded.store.put_bytes(b"a" * 1_400_000, "raw").result
+    repo_sharded.store.put_bytes(b"b" * 1_400_000, "raw").result
+    assert len(repo_sharded.backend.list_shards()) >= 2
+
+    called: list[tuple[str, int]] = []
+    real_vacuum_shard = repo_sharded.backend.vacuum_shard
+
+    def spy_vacuum_shard(sid):
+        called.append(("shard", int(sid)))
+        return real_vacuum_shard(sid)
+
+    monkeypatch.setattr(repo_sharded.backend, "vacuum_shard", spy_vacuum_shard)
+
+    # Cancel after start (call 1) but before the first shard (call 2); the
+    # index target is vacuumed unconditionally before the per-shard check.
+    op = repo_sharded.store.compact(cancel=CountingCancel(limit=1))
+    with pytest.raises(Cancelled):
+        op.result
+    assert called == []  # no shard was vacuumed
+    assert_repo_consistent(repo_sharded)
+
+
 def test_cancel_reencode_partial_progress_is_consistent(repo):
     refs = []
     for i in range(5):

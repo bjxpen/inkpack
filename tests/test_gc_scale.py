@@ -52,9 +52,12 @@ def test_gc_cancel_during_live_staging(repo):
     assert_repo_consistent(repo)  # nothing was deleted
 
 
-def test_gc_cancel_after_shard_commit_keeps_other_shard(repo_sharded):
-    """Decision G + Cancelled: committed shards stay deleted; the cancelled
-    shard is untouched (both its payloads and encodings remain)."""
+def test_gc_cancel_after_batch_commit_keeps_next_batch(repo_sharded, monkeypatch):
+    """Decision G amendment (B1) + Cancelled: committed BATCHES stay deleted;
+    the cancelled batch is untouched (both its payloads and encodings remain).
+
+    Default batching would put both shards in one batch, so the batch size is
+    pinned to 1 to retain per-batch commit coverage."""
     # Two payloads large enough to force a roll into shard 2.
     dead1 = repo_sharded.store.put_bytes(b"d" * 1_400_000, profile="raw").result
     dead2 = repo_sharded.store.put_bytes(b"e" * 1_400_000, profile="raw").result
@@ -63,20 +66,24 @@ def test_gc_cancel_after_shard_commit_keeps_other_shard(repo_sharded):
     shard_of_2 = int(enc_row(repo_sharded, dead2.ref)["shard_id"])
     assert shard_of_1 != shard_of_2
 
+    from inkpack.sqlite import SqliteBackend
+
+    monkeypatch.setattr(SqliteBackend, "_gc_batch_size", lambda self, s: 1)
+
     calls = {"n": 0}
 
     def token() -> bool:
         calls["n"] += 1
-        # Trip between the first shard's commit and the second shard's start:
-        # BlobStore start (1), backend start (2), before shard 1 (3),
-        # after shard 1 (4), before shard 2 (5 -> True).
+        # Batch checkpoints: BlobStore start (1), backend start (2),
+        # batch-1 start (3), post-batch-1 commit (4), batch-2 start (5 -> True).
         return calls["n"] > 4
 
     op = repo_sharded.store.gc(live=[], cancel=token)
     with pytest.raises(Cancelled):
         op.result
 
-    # One shard fully deleted, the other fully intact.
+    # The first batch (lowest shard id) committed fully; the second batch is
+    # untouched.
     first_gone = enc_row(repo_sharded, dead1.ref) is None
     second_gone = enc_row(repo_sharded, dead2.ref) is None
     assert first_gone != second_gone

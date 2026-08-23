@@ -234,6 +234,17 @@ class MissingContent(NotFound):
     """Stored content (encoding, payload or dictionary) is missing."""
 
 
+class Retryable(InkpackError):
+    """Transient contention or race condition; safe to retry the call.
+
+    Raised when a concurrent operation changed the repository between two
+    reads of the same call (e.g. an encoding vanished between prepare and
+    persist, or a shard locator changed repeatedly during a read). Subclasses
+    :class:`InkpackError` so existing handlers keep working (spec §11 —
+    additions to the minimum set are sanctioned).
+    """
+
+
 class CorruptContent(InkpackError):
     """Stored content failed to decode or failed identity verification."""
 
@@ -253,6 +264,11 @@ class UnknownProfile(NotFound, KeyError):
     (existing callers that catch ``KeyError`` keep working).
     """
 
+    def __str__(self) -> str:
+        # KeyError.__str__ repr-quotes its args; the typed-error message must
+        # stay plain (D4).
+        return NotFound.__str__(self)
+
 
 @dataclass(frozen=True)
 class Profile:
@@ -269,6 +285,12 @@ class Profile:
     codec: str
     params: Mapping[str, Any] = field(default_factory=dict[str, Any])
     zstd_dict_id: str | None = None
+
+    def __hash__(self) -> int:
+        # The dataclass-generated hash would include ``params`` (an arbitrary
+        # Mapping, not hashable). Equal profiles hash equal: the hash uses the
+        # hashable subset of the equality fields (D3).
+        return hash((self.name, self.codec, self.zstd_dict_id))
 
     def __post_init__(self) -> None:
         params = self.params
@@ -288,6 +310,15 @@ def check_cancel(cancel: CancelToken | None) -> None:
     """Raise :class:`Cancelled` if the optional cancel token requests it."""
     if cancel is not None and cancel():
         raise Cancelled("operation cancelled")
+
+
+def require_pk(value: Any, label: str) -> int:
+    """Validate a primary-key argument (locked decision M16): ``int``, not
+    ``bool``, non-negative. Single source for the backend and the Repository
+    public wrappers (E2)."""
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise TypeError(f"{label} must be a non-negative int, got {type(value).__name__}")
+    return value
 
 
 # -- profile config serialization -------------------------------------------

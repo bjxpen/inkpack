@@ -53,7 +53,7 @@ from inkpack.codec import IKB1, parse_blob_key_ikb1
 from inkpack.sqlite import Session, SqliteBackend, connect_file
 from inkpack.types import Operation, OpEvent
 
-from .conftest import assert_repo_consistent, make_profiles
+from .conftest import assert_repo_consistent, enc_row, make_profiles, payload_bytes
 
 PROFILES = {**make_profiles(), "zstd": Profile("zstd", "zstd", {"level": 3})}
 
@@ -119,7 +119,7 @@ def test_h1_stale_row_plus_new_payload_is_not_a_public_success(repo):
     # A stale row (codec 'none') paired with the NEW zstd payload must not
     # silently decode: the S3 length bound rejects it.
     with store.backend.session() as s:
-        new_payload = store.backend.get_payload(ref.blob_key, ref.profile, stale["shard_id"])
+        new_payload = payload_bytes(store, ref)
         with pytest.raises(CorruptContent):
             store._decode_from_row(s, stale, new_payload)
     # Public API returns the original bytes from a fresh snapshot.
@@ -142,7 +142,7 @@ def test_h2_dedupe_persist_repairs_or_refuses_if_payload_vanished(repo):
         if repo.backend.mode == "sqlite_single":
             conn.execute("DELETE FROM payload")
         else:
-            sid = repo.backend.get_encoding(first.ref.blob_key, "raw")["shard_id"]
+            sid = enc_row(repo, first.ref)["shard_id"]
             shard = connect_file(
                 repo.backend.shard_path(int(sid)),
                 repo.backend.busy_timeout_ms,
@@ -312,7 +312,7 @@ def test_m8_repair_rejects_non_object_codec_params(repo):
         if repo.backend.mode == "sqlite_single":
             conn.execute("DELETE FROM payload")
     if repo.backend.mode == "sqlite_sharded":
-        sid = repo.backend.get_encoding(ref.blob_key, "zstd")["shard_id"]
+        sid = enc_row(repo, ref)["shard_id"]
         shard = connect_file(
             repo.backend.shard_path(int(sid)),
             repo.backend.busy_timeout_ms,

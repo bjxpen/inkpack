@@ -110,7 +110,10 @@ def test_upsert_chapter_over_limit_raises_no_row(repo, monkeypatch):
 
 
 def test_limit_uses_connection_getlimit(repo):
-    assert repo.backend.blob_length_limit() == 1_000_000_000  # stock build default
+    # G3: portable bound. The stock default is 1,000,000,000 (1e9 — which is
+    # LESS than 1 << 30, so no GiB-based bound is portable); the assertion
+    # must hold on builds compiled with a different SQLITE_LIMIT_LENGTH too.
+    assert repo.backend.blob_length_limit() >= 500_000_000
 
 
 # -- §29 creation-time policy -------------------------------------------------

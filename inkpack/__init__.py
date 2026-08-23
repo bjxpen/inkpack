@@ -15,16 +15,23 @@ import os
 import shutil
 import time
 import uuid
+import warnings
 from pathlib import Path
 from typing import Any, cast
 
 from .blobstore import BlobStore
 from .codec import IKB1, CodecEngine, Identity
 from .repo import Repository
-from .sqlite import SqliteBackend
+from .sqlite import (
+    SqliteBackend,
+    # A9/E2: shared single-source validator for the sharded caps.
+    _require_positive_int,  # pyright: ignore[reportPrivateUsage]
+    repo_markers_exist,
+)
 from .types import (
     Busy,
     Cancelled,
+    CancelToken,
     ChapterInfo,
     Clock,
     CompactResult,
@@ -39,6 +46,7 @@ from .types import (
     Profile,
     PutResult,
     ReencodeResult,
+    Retryable,
     TrainDictResult,
     UnknownProfile,
     VerifyResult,
@@ -88,27 +96,19 @@ def _sweep_stale_creating_dirs(parent: Path) -> None:
             continue
 
 
-def _repo_markers_exist(root: Path) -> bool:
-    """A path is already a repository if index/repo markers exist OR the
-    payload dir holds any shard file (review H5)."""
-    if (root / "index.sqlite").exists() or (root / "repo.sqlite").exists():
-        return True
-    payload = root / "payload"
-    return payload.is_dir() and any(payload.glob("shard-*.sqlite"))
-
-
 def create_repo(
     path: str | os.PathLike[str],
     backend_mode: str = "sqlite_single",
     profiles: dict[str, Profile] | None = None,
     pragmas: dict[str, Any] | None = None,
     shard_cap_bytes: int = DEFAULT_SHARD_CAP_BYTES,
-    shard_min_bytes: int = DEFAULT_SHARD_MIN_BYTES,
+    min_shard_cap_bytes: int | None = None,
     verify_on_read: bool = False,
     *,
     identity: Identity | None = None,
     codec: CodecEngine | None = None,
     clock: Clock | None = None,
+    shard_min_bytes: int | None = None,
 ) -> Repository:
     """Create a new repository (spec 4.4) and return a ready-to-use Repository.
 
@@ -119,12 +119,15 @@ def create_repo(
     later create/open behaves as on a fresh path. ``~/...`` is expanded
     (D11/M24). The exists-check (D11/H5) runs BEFORE profile validation.
 
-    ``shard_min_bytes`` is the allowed floor for ``shard_cap_bytes`` (must be
-    a positive int, ``min <= cap``); routing uses only ``shard_cap_bytes``
-    (locked decision D4).
+    ``min_shard_cap_bytes`` is the allowed floor for ``shard_cap_bytes``
+    (must be a positive int, ``min <= cap``); routing uses only
+    ``shard_cap_bytes`` (locked decision D4). The persisted config key stays
+    ``shard_min_bytes`` (storage stability). The legacy ``shard_min_bytes``
+    keyword is accepted with a :class:`DeprecationWarning` for one minor
+    cycle (D1).
     """
     root = Path(path).expanduser().resolve()
-    if _repo_markers_exist(root):
+    if repo_markers_exist(root):
         raise InkpackError(f"repository already exists at {root}")
     if root.exists() and not root.is_dir():
         raise InkpackError(f"cannot create repository at {root}: path exists and is not a directory")
@@ -143,6 +146,28 @@ def create_repo(
     identity = identity or IKB1
     if not isinstance(cast("Any", verify_on_read), bool):
         raise TypeError(f"verify_on_read must be a bool, got {type(verify_on_read).__name__}")
+    # D1: legacy kwarg resolution (one minor cycle of DeprecationWarning).
+    if min_shard_cap_bytes is not None and shard_min_bytes is not None:
+        raise ValueError("pass min_shard_cap_bytes or the legacy shard_min_bytes, not both")
+    if shard_min_bytes is not None:
+        warnings.warn(
+            "create_repo(shard_min_bytes=...) is deprecated; use min_shard_cap_bytes "
+            "(the persisted config key stays 'shard_min_bytes')",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        min_shard_cap_bytes = shard_min_bytes
+    if min_shard_cap_bytes is None:
+        min_shard_cap_bytes = DEFAULT_SHARD_MIN_BYTES
+    if backend_mode == "sqlite_sharded":
+        # A9: validate the caps at the factory boundary — bool caps
+        # (``int(True) == 1``) fail fast here, before initial_config is built
+        # or any SQLite work happens. Single mode stays unvalidated (locked,
+        # Issue 16).
+        shard_cap_bytes = _require_positive_int(shard_cap_bytes, "shard_cap_bytes")
+        min_shard_cap_bytes = _require_positive_int(min_shard_cap_bytes, "min_shard_cap_bytes")
+        if min_shard_cap_bytes > shard_cap_bytes:
+            raise ValueError("min_shard_cap_bytes must not exceed shard_cap_bytes")
     initial_config: dict[str, Any] = {
         "identity_policy": identity.name,
         "backend_mode": backend_mode,
@@ -151,7 +176,8 @@ def create_repo(
     }
     if backend_mode == "sqlite_sharded":
         initial_config["shard_cap_bytes"] = int(shard_cap_bytes)
-        initial_config["shard_min_bytes"] = int(shard_min_bytes)
+        # Persisted config key intentionally stays 'shard_min_bytes' (D1).
+        initial_config["shard_min_bytes"] = int(min_shard_cap_bytes)
     tmp = root.parent / f".inkpack-creating-{uuid.uuid4().hex}"
     try:
         # Create-phase failures propagate raw (D5/H3): the temp dir is removed
@@ -161,7 +187,7 @@ def create_repo(
             mode=backend_mode,
             pragmas=pragmas,
             shard_cap_bytes=shard_cap_bytes,
-            shard_min_bytes=shard_min_bytes,
+            min_shard_cap_bytes=min_shard_cap_bytes,
             clock=clock,
             initial_config=initial_config,
         )
@@ -219,9 +245,10 @@ def open_repo(
 
 def _load_repo_config(
     backend: SqliteBackend, root: Path, mode: str, identity: Identity | None
-) -> dict[str, Any]:
+) -> None:
     """Validate the stored repo config strictly at open time (locked decision
-    D8 / review M12)."""
+    D8 / review M12). Returns nothing: the validated values land on the
+    backend (caps) and are read on demand (profiles)."""
     identity_policy = backend.config_get("identity_policy")
     if identity_policy is None:
         raise InkpackError(f"{root} is not an inkpack repository (repo_config.identity_policy missing)")
@@ -270,17 +297,13 @@ def _load_repo_config(
                 f"invalid repo config: shard_min_bytes ({backend.shard_min_bytes}) exceeds "
                 f"shard_cap_bytes ({backend.shard_cap_bytes})"
             )
-    return {
-        "identity_policy": identity_policy,
-        "backend_mode": configured_mode,
-        "profiles": stored_profiles,
-        "verify_on_read": verify_on_read,
-    }
+    return None
 
 
 __all__ = [
     "BlobStore",
     "Busy",
+    "CancelToken",
     "Cancelled",
     "ChapterInfo",
     "Clock",
@@ -297,6 +320,7 @@ __all__ = [
     "PutResult",
     "ReencodeResult",
     "Repository",
+    "Retryable",
     "TrainDictResult",
     "UnknownProfile",
     "VerifyResult",

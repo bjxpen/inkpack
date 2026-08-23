@@ -29,7 +29,7 @@ def make_profiles() -> dict[str, Profile]:
 
 def make_repo(tmp_path, mode: str = "sqlite_single", **kwargs):
     kwargs.setdefault("shard_cap_bytes", 2 << 20)
-    kwargs.setdefault("shard_min_bytes", 1 << 20)
+    kwargs.setdefault("min_shard_cap_bytes", 1 << 20)
     kwargs.setdefault("pragmas", {"busy_timeout_ms": 50})
     kwargs.setdefault("verify_on_read", False)
     profiles = kwargs.pop("profiles", None)
@@ -126,6 +126,47 @@ def delete_payload_row(repo, ref: ContentRef) -> None:
 def delete_dict(repo, dict_id: str) -> None:
     with repo.backend.txn(write=True) as conn:
         conn.execute("DELETE FROM dicts WHERE dict_id=?", (dict_id,))
+
+
+def corrupt_shard_btree_page(repo, ref: ContentRef) -> None:
+    """Deterministically corrupt the ``payload`` PK-index page for ``ref``.
+
+    The database file stays a *valid* SQLite database at connect time (header
+    and PRAGMAs all pass); the damage surfaces on the first statement that
+    touches the corrupted page (``database disk image is malformed`` —
+    ``sqlite3.DatabaseError``). This pins the present-but-unusable-shard
+    classification on paths where connect succeeds (A1/A2).
+    """
+    backend = repo.backend
+    if backend.mode == "sqlite_single":
+        path = backend.index_path
+    else:
+        row = enc_row(repo, ref)
+        assert row is not None, "no encoding row to corrupt"
+        path = backend.shard_path(int(row["shard_id"]))
+    probe = sqlite3.connect(str(path))
+    try:
+        row = probe.execute(
+            "SELECT rootpage FROM sqlite_master WHERE type='index' AND tbl_name='payload'"
+        ).fetchone()
+        assert row is not None, "no payload index to corrupt"
+        rootpage = int(row[0])
+        page_size = int(probe.execute("PRAGMA page_size").fetchone()[0])
+    finally:
+        probe.close()
+    data = bytearray(path.read_bytes())
+    data[(rootpage - 1) * page_size] = 0xDE  # invalid b-tree page type
+    path.write_bytes(bytes(data))
+    # Verify the corruption is visible through a fresh connection (guards
+    # against WAL replay restoring the page in sqlite_single mode).
+    check = sqlite3.connect(str(path))
+    try:
+        check.execute("SELECT 1 FROM payload WHERE blob_key=? AND profile=?", ("k", "raw")).fetchone()
+        raise AssertionError("corruption not visible through a fresh connection")
+    except sqlite3.DatabaseError:
+        pass
+    finally:
+        check.close()
 
 
 def all_encodings(repo) -> list[sqlite3.Row]:

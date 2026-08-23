@@ -34,12 +34,12 @@ The public API is deliberately small, and long operations report progress via
     configurable per-shard cap (default 2 GiB, min recommended 256 MiB).
     Cross-DB commits use `ATTACH` + rollback journal mode for atomicity.
 - **Maintenance** — `verify()` (decode + recompute identity), `gc(live)`
-  (delete unreferenced encodings/payloads/blobs/dicts, atomically per shard),
-  `compact()` (`VACUUM` of index and/or shards).
+  (delete unreferenced encodings/payloads/blobs/dicts, in batched atomic
+  exclusive windows), `compact()` (`VACUUM` of index and/or shards).
 - **KV metadata** — `meta_set/get/list` for novels and chapters, with strict
   entity-id normalization (decimal string of the integer primary key).
-- **Typed errors** — `NotFound`, `MissingContent`, `CorruptContent`, `Busy`,
-  `Cancelled`.
+- **Typed errors** — `NotFound`, `MissingContent`, `CorruptContent`,
+  `Retryable`, `Busy`, `Cancelled`.
 - **Cancellation** — every long operation accepts a cancel token.
 
 ---
@@ -57,6 +57,12 @@ Requires Python ≥ 3.11.
 
 ## Quickstart
 
+The block below is **executable as written** (pinned by
+`tests/test_r2_docs.py::test_readme_runnable_blocks_execute`): a fresh
+repository in your home directory, exercising the full
+write → read → maintain surface.
+
+<!-- runnable -->
 ```python
 from pathlib import Path
 from inkpack import create_repo, Profile
@@ -79,7 +85,9 @@ handle = store.open(ref)                    # io.BytesIO, safe to hold
 data = handle.read()
 
 # streaming put (non-seekable sources OK; hashed in one pass)
-with open("chapter.txt", "rb") as fh:
+chapter_path = Path("chapter.txt")
+chapter_path.write_bytes(b"streamed chapter body")
+with open(chapter_path, "rb") as fh:
     put = store.put_stream(fh, profile="zstd_nodict").result
 
 # --- repository model -----------------------------------------------------
@@ -91,26 +99,24 @@ chapter_id = repo.upsert_chapter(
 )
 assert repo.get_chapter_bytes(chapter_id) == b"once upon a time..."
 assert repo.open_chapter(chapter_id).read() == b"once upon a time..."
-
-`store.has_blob(key)` is True iff a `blobs` catalog row exists (decision A)
-— it does not mean this `ContentRef` is currently readable.
-
+body_ref = next(repo.iter_live_content())
+assert store.has_blob(body_ref.blob_key) is True
 repo.meta_set("novel", novel_id, "rating", 5)
-repo.meta_get("novel", novel_id, "rating")   # 5
-repo.meta_list("chapter", chapter_id)        # {"words": 4200, ...}
+assert repo.meta_get("novel", novel_id, "rating") == 5
+assert repo.meta_list("chapter", chapter_id)["words"] == 4200
 
 # --- catalog (no bodies) ---------------------------------------------------
 novel = repo.get_novel(novel_id)             # dict row; NotFound if missing
-repo.update_novel(novel_id, title="…", slug="…")
+repo.update_novel(novel_id, title="My Novel (retitled)", slug="my-novel")
 chapters = repo.list_chapters(novel_id)      # list[ChapterInfo], no bodies, ordered by order_key
                                            # (order_key is a TEXT sort: zero-pad, e.g. "001")
 info = repo.get_chapter(chapter_id)          # ChapterInfo
-repo.delete_chapter(chapter_id)              # catalog only; then gc(iter_live_content())
-repo.delete_novel(novel_id, cascade=True)    # catalog only; content reclaimed by gc
 
-# streaming chapter upsert (progress events, atomic content+catalog commit)
-op = repo.upsert_chapter_stream(fh, novel_id, "ch-002", "zstd_nodict")
-chapter_id = op.result                       # int; OpEvents while iterating
+# streaming chapter upsert (progress events, atomic content+catalog commit);
+# streams are consumed, so use a FRESH handle
+with open(chapter_path, "rb") as fh:
+    op = repo.upsert_chapter_stream(fh, novel_id, "ch-002", "zstd_nodict")
+    chapter2_id = op.result                  # int; OpEvents while iterating
 
 # --- dictionaries ---------------------------------------------------------
 trained = store.train_dict([b"sample prose " * 100] * 5).result
@@ -120,15 +126,24 @@ assert put.zstd_dict_id == trained.dict_id
 
 # --- maintenance -----------------------------------------------------------
 verify = store.verify().result               # VerifyResult(checked, ok, missing, corrupt)
+assert verify.missing == 0 and verify.corrupt == 0
 live = list(repo.iter_live_content())        # ContentRefs referenced by chapters
 gc = store.gc(live=live).result              # GcResult(...)
 compacted = store.compact().result           # CompactResult(mode, targets)
 reencoded = store.reencode(live).result      # ReencodeResult(...)
 
+# --- deletes are catalog-only (D12) ----------------------------------------
+repo.delete_chapter(chapter2_id)             # then gc(iter_live_content()) reclaims
+repo.delete_novel(novel_id, cascade=True)    # content reclaimed by gc
+
 # --- reopen ----------------------------------------------------------------
 from inkpack import open_repo
 repo2 = open_repo("~/novels")
+assert repo2.get_profiles().keys() == {"raw", "zstd_nodict", "zstd_dict"}
 ```
+
+`store.has_blob(key)` is True iff a `blobs` catalog row exists (decision A)
+— it does not mean that `ContentRef` is currently readable.
 
 ---
 
@@ -162,7 +177,10 @@ iterator object's close runs deterministically; CPython additionally delivers
 warns.
 Stream puts (`put_stream`, `upsert_chapter_stream`) emit `progress` events
 **live** while the source stream is being hashed — and the identity is
-computed exactly once (the spooled bytes are never re-hashed).
+computed exactly once (the spooled bytes are never re-hashed). Each stream
+put also emits one `phase` event (`phase="persist"`) at the hash→persist
+boundary (D6) — the only place a `phase` event is emitted today; other
+operations use `start`/`progress`/`item`/`done`.
 
 ### Operation reference
 
@@ -271,7 +289,8 @@ Unknown option keys, or `profile` combined with `codec`/`params`/
 | `InkpackError` | base class for all Inkpack errors; also config/layout problems on `open_repo` |
 | `NotFound` | a referenced entity does not exist — novels, chapters (catalog rows), or a missing repository on `open_repo` |
 | `MissingContent` | stored content is missing — encoding row, payload row, or required dictionary |
-| `CorruptContent` | payload fails to decode, or identity mismatch under `verify_on_read` |
+| `CorruptContent` | payload fails to decode, identity mismatch, stored-metadata inconsistency (e.g. `codec` ≠ `zstd` carrying a `zstd_dict_id`, lying `stored_len`), or a damaged payload schema |
+| `Retryable` | transient contention/race (e.g. an encoding vanished between prepare and persist, or a shard locator kept changing during a read) — safe to retry the call |
 | `Busy` | a writer operation times out on a locked database (SQLite busy/locked) |
 | `Cancelled` | a cancel token requested abort |
 | `UnknownProfile` | unknown profile name (subclasses both `NotFound` and `KeyError`, so either `except` style works) |
@@ -370,7 +389,9 @@ DBs). Key invariants:
   tamper is only caught by `verify_on_read`/`verify()` (identity recompute).
 - `blobs.raw_len` is verified against the key on every write (decision J): a
   mismatched stored `raw_len` raises `CorruptContent` and is never silently
-  "repaired".
+  "repaired". `verify()` enforces it per row too (A5: an encoding without a
+  `blobs` row, or a `raw_len` that disagrees with the key, counts as
+  `corrupt`).
 - Dedupe hits (decision E) never rewrite payload/encodings/`updated_at`; if
   the payload row is missing, `put_*` **repairs** it by re-encoding with the
   *stored* policy (never the current profile) — and the same repair applies
@@ -380,11 +401,17 @@ DBs). Key invariants:
   writable shard and `encodings.shard_id` is updated atomically in the same
   transaction. A hit with a missing required dictionary raises `MissingContent`
   ("put succeeded" implies "content is readable"); a stored key whose
-  `blob_key` does not match the content is rejected (`CorruptContent`).
+  `blob_key` does not match the content is rejected (`CorruptContent`); a hit
+  whose stored metadata is undecodable (e.g. `codec` ≠ `zstd` carrying a
+  `zstd_dict_id`) is rejected the same way the read path rejects it
+  (`CorruptContent`) — the hit probe is symmetric with decode (A4/N7).
 - GC keeps dictionaries referenced by **profiles** in `repo_config` alive
   (spec §9 amendment), so `train_dict → set_profile → gc → put` never loses
   the dictionary; drop the profile reference and GC reclaims it.
-- `encodings.stored_len` always equals `len(payload.data)`.
+- `encodings.stored_len` always equals `len(payload.data)`, and **every read
+  enforces it** (A5): a payload whose length disagrees with `stored_len` is
+  `CorruptContent` from `get_bytes`/`open`/`verify`/`reencode` targets, so a
+  lying row can never be silently re-encoded over.
 - `encodings.zstd_dict_id` is `NULL` unless `codec == "zstd"` and a dict was
   used; dictionaries live only in the index DB.
 - `encodings.codec_params_json` is canonical JSON (sorted keys, compact
@@ -396,11 +423,24 @@ DBs). Key invariants:
   writes commit atomically via `ATTACH`; index and shard DBs must stay in
   rollback journal mode (`delete`/`truncate`) — `open_repo()` refuses WAL.
 - `open(ref)` is `io.BytesIO(get_bytes(ref))` — fully materialized, stable
-  even across GC (spec §6.3).
+  even across GC or an in-place reencode (spec §6.3).
 - `verify()` classifies each encoding as `ok` / `missing` (payload or dict
-  row absent) / `corrupt` (decode failure or identity mismatch).
-- `gc(live)` deletes encodings + payloads not in the live set (atomically
-  per shard), then orphan `blobs`, then unreferenced `dicts`.
+  row absent) / `corrupt`. `corrupt` covers decode failure, identity
+  mismatch, a damaged payload schema, a missing/lying `blobs.raw_len`, and a
+  lying `stored_len` (A3/A5). `MemoryError` is never counted as corrupt — it
+  aborts the run (A7).
+- `gc(live)` deletes encodings + payloads not in the live set in **batched
+  atomic exclusive windows** (Decision G amendment, B1): each batch of up to
+  the attach-limit shards runs one `BEGIN IMMEDIATE … COMMIT` that
+  recomputes the dead set fresh inside the window, so a put that completed
+  before a batch's snapshot is authorizable, and a put racing the window
+  blocks, is absent from the snapshot, and self-heals. Cancellation keeps
+  committed batches; the in-flight batch rolls back whole. Then orphan
+  `blobs`, then unreferenced `dicts`. See [GUARANTEES.md](GUARANTEES.md).
+- `iter_live_content()` is **weakly consistent but monotone-safe for GC
+  staging** (C3): it pages 1000 rows per short read transaction, so a page
+  boundary can capture late additions in a later page and retain refs deleted
+  mid-drain (safe over-retention), but can never miss a live ref.
 - Schema versioning: `PRAGMA user_version` tracks the index schema;
   forward-only, idempotent migrations (`inkpack/sqlite.py::MIGRATIONS`).
 
@@ -418,8 +458,9 @@ stored shard caps.
 
 ```python
 create_repo(path, backend_mode="sqlite_single", profiles=None,
-            pragmas=None, shard_cap_bytes=2 << 30, shard_min_bytes=256 << 20,
-            verify_on_read=False, *, identity=None, codec=None, clock=None) -> Repository
+            pragmas=None, shard_cap_bytes=2 << 30, min_shard_cap_bytes=None,
+            verify_on_read=False, *, identity=None, codec=None, clock=None,
+            shard_min_bytes=None) -> Repository   # shard_min_bytes: DEPRECATED alias
 
 open_repo(path, pragmas=None, *, identity=None, codec=None, clock=None) -> Repository
 ```
@@ -442,19 +483,26 @@ open_repo(path, pragmas=None, *, identity=None, codec=None, clock=None) -> Repos
   creation — it is per-connection, so there is no persistent substitute.
 - `verify_on_read`: when `True`, `get_bytes`/`open` recompute the identity
   and raise `CorruptContent` on mismatch (slower; `verify()` is the default
-  full check). Read once per call.
+  full check). Read once per call. Toggle at runtime with
+  `repo.set_verify_on_read(flag)` (D2; strict `bool`, one txn RMW).
 - `identity` / `codec` / `clock`: dependency-injection hooks (see below). A
   custom `Identity` must implement `hasher()` — `put_stream` /
   `upsert_chapter_stream` hash through the incremental hasher.
-- `shard_cap_bytes`/`shard_min_bytes` apply to `sqlite_sharded` only.
-  `shard_min_bytes` is the allowed floor for `shard_cap_bytes` (must be a
-  positive int, `min ≤ cap`); **routing uses only `shard_cap_bytes`** (D4) —
-  writes roll to a fresh shard once the current shard file exceeds the cap
-  (the write pointer is the highest shard id, never the lexically-last path).
-- Connection policy: one operation-scoped session per public call — `get_bytes`
-  opens 1 connection, `verify`/`reencode`/`gc` are O(1)-O(shards) connections
-  instead of one per row, and GC's TEMP tables live for the whole operation.
-  `compact()` still VACUUMs on a virgin connection with no attached databases.
+- `shard_cap_bytes`/`min_shard_cap_bytes` apply to `sqlite_sharded` only.
+  `min_shard_cap_bytes` (persisted under the stable key `shard_min_bytes`) is
+  the allowed floor for `shard_cap_bytes` (positive non-bool ints,
+  `min ≤ cap`); **routing uses only `shard_cap_bytes`** (D4) — writes roll to
+  a fresh shard once the current shard file exceeds the cap (the write
+  pointer is the highest shard id, never the lexically-last path). The
+  legacy `shard_min_bytes` keyword is accepted with a `DeprecationWarning`
+  for one minor cycle (D1).
+- Connection policy (scoped to **BlobStore operations**, C5): one
+  operation-scoped session per `BlobStore` call — `get_bytes` opens 1
+  connection, `verify`/`reencode`/`gc` are O(1) connections with O(shards)
+  session-managed ATTACHes (C1) instead of one per row, and GC's TEMP tables
+  live for the whole operation. `compact()` still VACUUMs on a virgin
+  connection with no attached databases. `Repository` catalog calls
+  (novels/chapters/meta) each open their own short-lived connection.
 - **Write pointer (N6).** Writes go to the highest shard id; `compact()` does
   not move writes backward, and empty low shards stay until an admin deletes
   them.
@@ -467,15 +515,23 @@ open_repo(path, pragmas=None, *, identity=None, codec=None, clock=None) -> Repos
 
 ### Dependency injection
 
+<!-- runnable -->
 ```python
+from pathlib import Path
+from inkpack import Profile, create_repo
 from inkpack.codec import CodecEngine, IKB1
 from inkpack.sqlite import SqliteBackend
 from inkpack.blobstore import BlobStore
 from inkpack.repo import Repository
 
-backend = SqliteBackend.open(path, mode="sqlite_single")
+# create_repo does this composition for you; the parts are public for
+# advanced wiring (custom codec engines / identities / clocks).
+root = Path.home() / "inkpack-di-demo"
+create_repo(root, profiles={"raw": Profile("raw", "none", {})})
+backend = SqliteBackend.open(root, mode="sqlite_single")
 store = BlobStore(backend=backend, codec=CodecEngine(), identity=IKB1)
 repo = Repository(backend=backend, store=store)
+assert repo.get_profile("raw").codec == "none"
 ```
 
 The default identity is `ikb1`; a custom identity must declare `name` and
@@ -488,6 +544,7 @@ match the stored `identity_policy` when the repo is reopened.
 ```bash
 pip install -r requirements-dev.txt
 python -m pytest                     # full suite (both backends + fuzz + hypothesis)
+python -m pytest -m slow             # bench-gated timing tests (C4), excluded by default
 ruff check inkpack tests             # lint
 mypy inkpack --strict                # type check
 pyright inkpack                      # type check (strict)
@@ -509,6 +566,11 @@ tests/
   test_repo_model.py            # novels/chapters/KV metadata/live refs
   test_sharded_backend.py       # shard routing, journal-mode enforcement
   test_fuzz.py                  # seeded fuzz + hypothesis property tests
+  test_r2_error_model.py        # A: typed-error model (no raw sqlite leaks, etc.)
+  test_r2_concurrency.py        # B: GC exclusive window, txn placement (H1 failpoints)
+  test_r2_performance.py        # C: session attaches, zstd context reuse, paging
+  test_r2_api_docs.py           # D/E: API surface + maintainability guards
+  test_r2_docs.py               # F: README runnable blocks execute as written
 ```
 
 ## Scope

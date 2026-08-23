@@ -33,6 +33,7 @@ import pytest
 
 from inkpack import (
     Busy,
+    CorruptContent,
     InkpackError,
     MissingContent,
     Profile,
@@ -40,7 +41,7 @@ from inkpack import (
 )
 from inkpack.sqlite import SqliteBackend
 
-from .conftest import make_profiles
+from .conftest import enc_row, make_profiles, payload_bytes
 
 PROFILES = make_profiles()
 
@@ -168,13 +169,13 @@ def test_put_rehomes_when_shard_file_deleted(repo_sharded):
     store = repo_sharded.store
     data = b"rehome-me"
     ref = store.put_bytes(data, "raw").result.ref
-    row = repo_sharded.backend.get_encoding(ref.blob_key, ref.profile)
+    row = enc_row(repo_sharded, ref)
     repo_sharded.backend.shard_path(int(row["shard_id"])).unlink()
 
     again = store.put_bytes(data, "raw").result
     assert again.ref.blob_key == ref.blob_key
     assert store.get_bytes(again.ref) == data
-    new_row = repo_sharded.backend.get_encoding(ref.blob_key, ref.profile)
+    new_row = enc_row(repo_sharded, ref)
     assert new_row["shard_id"] is not None
     assert repo_sharded.backend.shard_path(int(new_row["shard_id"])).exists()
 
@@ -184,12 +185,12 @@ def test_upsert_rehomes_when_shard_file_deleted(repo_sharded):
     novel_id = repo_sharded.create_novel("n")
     repo_sharded.upsert_chapter(novel_id, "a", data, "raw")
     ref = next(r for r in repo_sharded.iter_live_content())
-    row = repo_sharded.backend.get_encoding(ref.blob_key, ref.profile)
+    row = enc_row(repo_sharded, ref)
     repo_sharded.backend.shard_path(int(row["shard_id"])).unlink()
 
     chapter_b = repo_sharded.upsert_chapter(novel_id, "b", data, "raw")
     assert repo_sharded.get_chapter_bytes(chapter_b) == data
-    new_row = repo_sharded.backend.get_encoding(ref.blob_key, ref.profile)
+    new_row = enc_row(repo_sharded, ref)
     assert repo_sharded.backend.shard_path(int(new_row["shard_id"])).exists()
 
 
@@ -324,14 +325,38 @@ def test_single_mode_does_not_validate_shard_caps(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_missing_shard_classified_by_path_not_message(repo_sharded, monkeypatch):
+def test_missing_shard_never_connects(repo_sharded, monkeypatch):
+    """G2(a): a missing shard file is classified by the path check —
+    ``connect_file`` is NEVER invoked for it (no message-text parsing)."""
     import inkpack.sqlite as sqlite_mod
 
     store = repo_sharded.store
     data = b"missing-shard-msg"
     ref = store.put_bytes(data, "raw").result.ref
-    row = repo_sharded.backend.get_encoding(ref.blob_key, ref.profile)
+    row = enc_row(repo_sharded, ref)
     repo_sharded.backend.shard_path(int(row["shard_id"])).unlink()
+
+    real = sqlite_mod.connect_file
+
+    def boom(db_path, *args, **kwargs):
+        if db_path.name.startswith("shard-"):
+            raise AssertionError("connect_file must not be invoked for a missing shard")
+        return real(db_path, *args, **kwargs)
+
+    monkeypatch.setattr(sqlite_mod, "connect_file", boom)
+    prepared = store.prepare_bytes(data, "raw")
+    assert prepared.enc is not None  # missing payload -> repair path, not a healthy hit
+
+
+def test_present_unusable_shard_is_corrupt(repo_sharded, monkeypatch):
+    """G2(b): a PRESENT shard file whose connection fails with a generic
+    OperationalError is CorruptContent (present-but-unusable), never Busy
+    and never a raw leak."""
+    import inkpack.sqlite as sqlite_mod
+
+    store = repo_sharded.store
+    data = b"present-unusable"
+    store.put_bytes(data, "raw").result
 
     real = sqlite_mod.connect_file
 
@@ -341,8 +366,8 @@ def test_missing_shard_classified_by_path_not_message(repo_sharded, monkeypatch)
         return real(db_path, *args, **kwargs)
 
     monkeypatch.setattr(sqlite_mod, "connect_file", shard_only)
-    prepared = store.prepare_bytes(data, "raw")
-    assert prepared.enc is not None  # miss/repair, not a healthy hit
+    with pytest.raises(CorruptContent):
+        store.put_bytes(data, "raw").result
 
 
 # ---------------------------------------------------------------------------
@@ -354,9 +379,9 @@ def test_gc_sweeps_payloads_not_referenced_by_encodings(repo_sharded):
     store = repo_sharded.store
     backend = repo_sharded.backend
     ref = store.put_bytes(b"wrong-locator", "raw").result.ref
-    row = backend.get_encoding(ref.blob_key, ref.profile)
+    row = enc_row(repo_sharded, ref)
     old = int(row["shard_id"])
-    payload = backend.get_payload(ref.blob_key, ref.profile, old)
+    payload = payload_bytes(repo_sharded, ref)
     new = old + 1
     backend.ensure_shard_exists(new)
     with backend.txn(write=True, attach_shard_id=new) as conn:
@@ -395,15 +420,15 @@ def test_read_attach_does_not_call_payload_migration(repo_sharded, monkeypatch):
     called = {"n": 0}
     real = sqlite_mod.migrate_payload_attached
 
-    def wrapped(conn):
+    def wrapped(conn, alias="p"):
         called["n"] += 1
-        return real(conn)
+        return real(conn, alias=alias)
 
     monkeypatch.setattr(sqlite_mod, "migrate_payload_attached", wrapped)
     ref = repo_sharded.store.put_bytes(b"x", "raw").result.ref
     called["n"] = 0
     repo_sharded.store.get_bytes(ref)
-    assert called["n"] == 0
+    assert called["n"] == 0  # reads never DDL (N2); the put above already migrated
 
 
 def test_read_shard_conn_does_not_migrate_payload(repo_sharded, monkeypatch):

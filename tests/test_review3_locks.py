@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import io
 import sqlite3
+import sys
 
 import pytest
 
@@ -38,7 +39,6 @@ from inkpack import (
     Cancelled,
     ContentRef,
     CorruptContent,
-    InkpackError,
     MissingContent,
     NotFound,
     Profile,
@@ -48,7 +48,7 @@ from inkpack import (
 from inkpack.codec import blob_key_ikb1_bytes, parse_blob_key_ikb1
 from inkpack.sqlite import SqliteBackend, connect_file
 
-from .conftest import assert_repo_consistent, delete_payload_row, make_profiles
+from .conftest import assert_repo_consistent, delete_payload_row, enc_row, make_profiles
 
 # -- S1 / P0-OP-1: close() prevents work from starting ------------------------
 
@@ -130,13 +130,13 @@ def test_repair_rehomes_and_never_leaves_junk_shard(repo_sharded):
     backend = repo_sharded.backend
 
     put = store.put_bytes(b"hello" * 50, "raw").result
-    row = backend.get_encoding(put.ref.blob_key, put.ref.profile)
+    row = enc_row(repo_sharded, put.ref)
     backend.shard_path(int(row["shard_id"])).unlink()
 
     before = set(backend.payload_dir.glob("shard-*.sqlite"))
 
     put2 = store.put_bytes(b"hello" * 50, "raw").result  # must rehome, not leak
-    row2 = backend.get_encoding(put2.ref.blob_key, put2.ref.profile)
+    row2 = enc_row(repo_sharded, put2.ref)
     assert backend.shard_path(int(row2["shard_id"])).exists()
 
     after = set(backend.payload_dir.glob("shard-*.sqlite"))
@@ -151,9 +151,7 @@ def test_upsert_repair_rehomes_when_shard_missing(repo_sharded):
     novel_id = repo_sharded.create_novel("Rehome")
     body = b"upsert-rehome " * 100
     chapter_id = repo_sharded.upsert_chapter(novel_id, "1", body, "raw")
-    row = repo_sharded.backend.get_encoding(
-        repo_sharded.get_chapter(chapter_id).blob_key, "raw"
-    )
+    row = enc_row(repo_sharded, ContentRef(repo_sharded.get_chapter(chapter_id).blob_key, "raw"))
     repo_sharded.backend.shard_path(int(row["shard_id"])).unlink()
 
     repo_sharded.upsert_chapter(novel_id, "1", body, "raw")
@@ -174,7 +172,10 @@ def test_create_open_unusual_paths(tmp_path, name):
     assert reopened.get_chapter_bytes(chapter_id) == b"hello"
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="'?' is an illegal filename character on Windows")
 def test_create_open_question_mark_path(tmp_path):
+    # G4: the URI-escaping (P0-URI-1) is what makes '?' legal off-Windows;
+    # on Windows the OS itself forbids the name, so skip there.
     root = tmp_path / "novels?backup"
     repo = create_repo(root, backend_mode="sqlite_single", profiles=make_profiles())
     repo.create_novel("t")
@@ -275,33 +276,25 @@ def test_codec_none_length_mismatch_is_corrupt(repo):
 # -- P1-UP-1: dedupe-hit upsert re-probes the payload in-txn ---------------------
 
 
-def test_dedupe_hit_upsert_checks_payload_in_txn(repo):
-
-    novel_id = repo.create_novel("n")
+def test_persist_prepared_refuses_vanished_payload_without_raw(repo):
+    """E1 guard: the divergence of the removed
+    ``upsert_chapter_with_content`` (in-txn payload re-probe refuses without
+    raw bytes) is preserved on the shared persist path: a dedupe hit whose
+    payload vanished, with no raw bytes to repair, is MissingContent — never
+    a silent success, never a half-commit. Passes today and must keep
+    passing (locks ``persist_prepared``'s refusal branch)."""
     body = b"same-bytes"
-    repo.upsert_chapter(novel_id, "a", body, "raw")
-
+    ref = repo.store.put_bytes(body, "raw").result.ref
     prepared = repo.store.prepare_bytes(body, "raw")
     assert prepared.enc is None
-
-    delete_payload_row(repo, ContentRef(prepared.blob_key, prepared.profile))
-
-    with pytest.raises((InkpackError, MissingContent)):
-        repo.backend.upsert_chapter_with_content(
-            novel_id=novel_id,
-            order_key="b",
-            blob_key=prepared.blob_key,
-            raw_len=prepared.raw_len,
-            created_at=repo.backend.now(),
-            profile=prepared.profile,
-            media_type=None,
-            charset=None,
-            meta=None,
-            enc=None,
-            shard_id=None,
-        )
-
-    assert all(c.order_key != "b" for c in repo.list_chapters(novel_id))
+    delete_payload_row(repo, ref)
+    attach = prepared.shard_id if repo.backend.mode == "sqlite_sharded" else None
+    with repo.backend.session() as s, repo.backend.txn_on(
+        s.conn, write=True, attach_shard_id=attach
+    ) as conn, pytest.raises(MissingContent):
+        repo.store.persist_prepared(conn, s, prepared, None, repo.backend.now())
+    # Nothing was half-written: the encoding row is untouched.
+    assert enc_row(repo, ref) is not None
 
 
 # -- P1-CFG-1: set_profile is an atomic read-modify-write -----------------------
@@ -370,7 +363,7 @@ def test_reencode_oversize_skips_target(repo, monkeypatch):
 
 def test_corrupt_shard_is_corrupt(repo_sharded):
     put = repo_sharded.store.put_bytes(b"hello" * 100, "raw").result
-    row = repo_sharded.backend.get_encoding(put.ref.blob_key, put.ref.profile)
+    row = enc_row(repo_sharded, put.ref)
     path = repo_sharded.backend.shard_path(int(row["shard_id"]))
     path.write_bytes(b"not a sqlite db")
 
@@ -489,14 +482,27 @@ def test_options_validated_at_call_time(repo):
 
 
 def test_payload_exists_does_not_fetch_blob(repo_single, monkeypatch):
+    """P2-EXISTS-1 (E1): ``payload_exists`` is a ``SELECT 1`` probe.
+
+    The whole-blob fetch path (the old ``backend.get_payload``) is gone; this
+    locks the probe shape so a regression to fetching ``data`` is caught.
+    """
+    from inkpack.sqlite import Session
+
     ref = repo_single.store.put_bytes(b"abc" * 10, "raw").result.ref
+    seen: list[str] = []
+    original = Session.query_one
 
-    def boom(*args, **kwargs):
-        raise AssertionError("must not fetch the whole blob")
+    def spy(self, sql, params=()):
+        seen.append(sql)
+        return original(self, sql, params)
 
-    monkeypatch.setattr(repo_single.backend, "get_payload", boom)
+    monkeypatch.setattr(Session, "query_one", spy)
     with repo_single.backend.session() as s:
         assert s.payload_exists(ref.blob_key, ref.profile, None) is True
+    payload_probes = [q for q in seen if "payload" in q]
+    assert payload_probes, "payload_exists must probe the payload table"
+    assert all(q.strip().startswith("SELECT 1 FROM payload") for q in payload_probes)
 
 
 # -- S6: entity id normalization ---------------------------------------------------

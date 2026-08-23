@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from collections import OrderedDict
 from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
 from typing import Any, BinaryIO, Protocol
@@ -238,12 +239,74 @@ class CodecEngine:
     never see raw ``zstandard`` exceptions:
     - encode-side problems (bad profile params, unusable dictionary) become
       :class:`ValueError` with an actionable message;
-    - decode-side problems become :class:`CorruptContent`.
+    - decode-side problems become :class:`CorruptContent`;
+    - ``MemoryError`` propagates (it is a resource failure, never a content
+      or policy error — A7).
+
+    zstd contexts are cached per (level, dict id) / (dict id) in an LRU
+    (C2): a bulk reencode over N targets builds one compressor instead of
+    N. The one-shot ``compress``/``decompress`` APIs are share-safe in
+    python-zstandard (the dependency is pinned for this reason); an engine
+    is used from the threads that drive its repository's operations.
     """
 
     dict_codec = "zstd"
+    _CONTEXT_CACHE_MAX = 32
 
-    def encode(self, raw: bytes, profile: Profile, dict_bytes: bytes | None) -> Encoded:
+    def __init__(self) -> None:
+        self._compressors: OrderedDict[tuple[int, str | None], _zstd.ZstdCompressor] = OrderedDict()
+        self._decompressors: OrderedDict[tuple[str | None], _zstd.ZstdDecompressor] = OrderedDict()
+
+    # -- context cache (C2) ---------------------------------------------------
+
+    def _compressor(
+        self, level: int, dict_bytes: bytes | None, dict_cache_key: str | None
+    ) -> _zstd.ZstdCompressor:
+        """Get-or-create the (level, dict id) compressor; LRU at 32.
+
+        A dict whose id is unknown to the caller is deliberately NOT cached
+        (keying by ``id(bytes)`` would be wrong; an uncached context is only
+        a performance loss, never a correctness one).
+        """
+        if dict_bytes is not None and dict_cache_key is None:
+            dict_data_eager = _zstd.ZstdCompressionDict(dict_bytes)
+            return _zstd.ZstdCompressor(level=level, dict_data=dict_data_eager)
+        key = (level, dict_cache_key)
+        compressor = self._compressors.get(key)
+        if compressor is None:
+            dict_data = _zstd.ZstdCompressionDict(dict_bytes) if dict_bytes is not None else None
+            compressor = _zstd.ZstdCompressor(level=level, dict_data=dict_data)
+            self._compressors[key] = compressor
+            while len(self._compressors) > self._CONTEXT_CACHE_MAX:
+                self._compressors.popitem(last=False)
+        else:
+            self._compressors.move_to_end(key)
+        return compressor
+
+    def _decompressor(self, dict_bytes: bytes | None, dict_cache_key: str | None) -> _zstd.ZstdDecompressor:
+        if dict_bytes is not None and dict_cache_key is None:
+            dict_data_eager = _zstd.ZstdCompressionDict(dict_bytes)
+            return _zstd.ZstdDecompressor(dict_data=dict_data_eager)
+        key = (dict_cache_key,)
+        decompressor = self._decompressors.get(key)
+        if decompressor is None:
+            dict_data = _zstd.ZstdCompressionDict(dict_bytes) if dict_bytes is not None else None
+            decompressor = _zstd.ZstdDecompressor(dict_data=dict_data)
+            self._decompressors[key] = decompressor
+            while len(self._decompressors) > self._CONTEXT_CACHE_MAX:
+                self._decompressors.popitem(last=False)
+        else:
+            self._decompressors.move_to_end(key)
+        return decompressor
+
+    def encode(
+        self,
+        raw: bytes,
+        profile: Profile,
+        dict_bytes: bytes | None,
+        *,
+        dict_cache_key: str | None = None,
+    ) -> Encoded:
         if profile.codec == "none":
             return Encoded(
                 codec="none",
@@ -258,8 +321,9 @@ class CodecEngine:
         if not isinstance(level, int) or isinstance(level, bool) or not 1 <= level <= 22:
             raise ValueError(f"zstd level must be an integer in 1..22, got {level!r}")
         try:
-            dict_data = _zstd.ZstdCompressionDict(dict_bytes) if dict_bytes is not None else None
-            payload = _zstd.ZstdCompressor(level=level, dict_data=dict_data).compress(raw)
+            payload = self._compressor(level, dict_bytes, dict_cache_key).compress(raw)
+        except MemoryError:
+            raise  # OOM is a resource failure, never an encoding-policy error (A7)
         except Exception as exc:
             raise ValueError(
                 f"zstd encode failed (profile {profile.name!r}, level {level}): {exc}"
@@ -280,6 +344,7 @@ class CodecEngine:
         codec_params_json: str,
         dict_bytes: bytes | None,
         max_output_size: int | None = None,
+        dict_cache_key: str | None = None,
     ) -> bytes:
         # codec_params_json is intentionally ignored for decode: 'none' and
         # zstd store everything needed in the frame; params only shape writes
@@ -304,6 +369,8 @@ class CodecEngine:
             # its output buffer regardless of max_output_size).
             try:
                 declared = _zstd.frame_content_size(encoded)
+            except MemoryError:
+                raise
             except Exception as exc:
                 raise CorruptContent(f"zstd decode failed: {exc}") from exc
             if declared < 0:
@@ -318,13 +385,13 @@ class CodecEngine:
                     f"zstd frame declares {declared} bytes, exceeding the bound of "
                     f"{max_output_size} declared by the blob_key"
                 )
+        decompressor = self._decompressor(dict_bytes, dict_cache_key)
         try:
-            dict_data = _zstd.ZstdCompressionDict(dict_bytes) if dict_bytes is not None else None
             if max_output_size is not None:
-                return _zstd.ZstdDecompressor(dict_data=dict_data).decompress(
-                    encoded, max_output_size=max_output_size
-                )
-            return _zstd.ZstdDecompressor(dict_data=dict_data).decompress(encoded)
+                return decompressor.decompress(encoded, max_output_size=max_output_size)
+            return decompressor.decompress(encoded)
+        except MemoryError:
+            raise  # A7
         except Exception as exc:
             raise CorruptContent(f"zstd decode failed: {exc}") from exc
 

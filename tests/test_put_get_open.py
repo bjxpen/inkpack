@@ -115,6 +115,16 @@ def test_open_is_materialized_and_survives_gc(repo):
     assert handle.read() == data
 
 
+def test_open_handle_survives_reencode(repo):
+    """G4 / spec 6.3: ``open()`` is fully materialized — an in-place
+    reencode of the same ref must not change what the handle returns."""
+    data = b"stable-reencode" * 100
+    put = repo.store.put_bytes(data, profile="zstd_nodict").result
+    handle = repo.store.open(put.ref)
+    repo.store.reencode([put.ref], options={"codec": "none"}).result
+    assert handle.read() == data
+
+
 def test_decode_uses_stored_encoding_metadata_not_profile(repo):
     """Spec 6.2 MUST: profile changes must not affect decoding."""
     data = b"hello world " * 500

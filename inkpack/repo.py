@@ -3,12 +3,21 @@
 from __future__ import annotations
 
 import io
+import sqlite3
 import tempfile
 from collections.abc import Generator, Iterator
 from typing import Any, BinaryIO, cast
 
-from .blobstore import BlobStore, PreparedPut, RepairRequired
-from .sqlite import SqliteBackend
+from .blobstore import (
+    SPOOL_MAX_SIZE,
+    BlobStore,
+    PreparedPut,
+    # E5/A8: intentional cross-module internals (private within the package).
+    _RepairRequired,  # pyright: ignore[reportPrivateUsage]
+    _require_binary_stream,  # pyright: ignore[reportPrivateUsage]
+)
+from .failpoints import failpoint
+from .sqlite import Session, SqliteBackend
 from .types import (
     CancelToken,
     ChapterInfo,
@@ -18,10 +27,12 @@ from .types import (
     Operation,
     OpEvent,
     Profile,
+    Retryable,
     UnknownProfile,
     check_cancel,
     profiles_from_config,
     profiles_to_config,
+    require_pk,
     validate_profiles,
 )
 
@@ -50,43 +61,78 @@ class Repository:
         The profile is validated (codec must be ``none``/``zstd``,
         ``zstd_dict_id`` only with ``zstd``) before being stored, so invalid
         definitions fail fast instead of surfacing later at write time. The
-        read-modify-write happens inside ONE write transaction (review
-        P1-CFG-1): concurrent ``set_profile`` calls cannot lose updates.
+        dictionary-existence check AND the read-modify-write happen inside
+        ONE write transaction (review P1-CFG-1, B2): concurrent
+        ``set_profile`` calls cannot lose updates, and the check cannot be
+        interleaved with gc's single-txn dict reclamation (check passes →
+        gc deletes the dict → profile references a ghost) — with both in the
+        same txn every interleaving serializes correctly.
         """
         if not isinstance(cast("Any", profile), Profile):
             raise TypeError(f"profile must be a Profile instance, got {type(profile).__name__}")
         validate_profiles({profile.name: profile})
-        self._require_known_dicts({profile.name: profile})
 
-        def _merge(current: Any) -> dict[str, Any]:
+        def _merge(current: Any, conn: sqlite3.Connection) -> dict[str, Any]:
+            self._require_known_dicts({profile.name: profile}, conn=conn)
             profiles = profiles_from_config(current)
             profiles[profile.name] = profile
             return profiles_to_config(profiles)
 
-        self.backend.config_update("profiles", _merge)
+        self.backend.config_update_in_txn("profiles", _merge)
 
     def set_profiles(self, profiles: dict[str, Profile]) -> None:
         """Replace the whole profile set and persist it in the repo config.
 
         The set must be non-empty, every entry valid, and every referenced
-        dictionary must exist in this repository (Issue 12). Existing stored
-        content is unaffected (decoding never consults profiles, spec 6.2).
+        dictionary must exist in this repository (Issue 12). The dictionary
+        check and the replacement commit in ONE write transaction (B2).
+        Existing stored content is unaffected (decoding never consults
+        profiles, spec 6.2).
         """
         validate_profiles(profiles)
-        self._require_known_dicts(profiles)
-        self.backend.config_set("profiles", profiles_to_config(profiles))
 
-    def _require_known_dicts(self, profiles: dict[str, Profile]) -> None:
+        def _replace(_current: Any, conn: sqlite3.Connection) -> dict[str, Any]:
+            self._require_known_dicts(profiles, conn=conn)
+            return profiles_to_config(profiles)
+
+        self.backend.config_update_in_txn("profiles", _replace)
+
+    def set_verify_on_read(self, flag: bool) -> None:
+        """Toggle the ``verify_on_read`` repo config (D2).
+
+        Strict ``bool``; the RMW goes through the in-txn config update (B2
+        machinery) so concurrent toggles cannot lose updates. ``get_bytes``/
+        ``open`` pick the new value up on their next call.
+        """
+        if not isinstance(cast("Any", flag), bool):
+            raise TypeError(f"verify_on_read must be a bool, got {type(flag).__name__}")
+        self.backend.config_update_in_txn("verify_on_read", lambda _current, _conn: flag)
+
+    def _require_known_dicts(
+        self, profiles: dict[str, Profile], conn: sqlite3.Connection | None = None
+    ) -> None:
         """Raise MissingContent listing dictionary ids referenced by profiles
-        that do not exist in this repository (Issue 12)."""
-        missing = sorted(
-            p.zstd_dict_id
-            for p in profiles.values()
-            if p.zstd_dict_id is not None and self.backend.get_dict(p.zstd_dict_id) is None
-        )
+        that do not exist in this repository (Issue 12, B2).
+
+        With ``conn`` supplied the checks run on that connection — inside the
+        caller's write transaction — so the check is atomic with the profile
+        write. Without it (diagnostic paths) a read probe is used.
+        """
+        missing: list[str] = []
+        for p in profiles.values():
+            if p.zstd_dict_id is None:
+                continue
+            if conn is not None:
+                row = conn.execute(
+                    "SELECT 1 FROM dicts WHERE dict_id=?", (p.zstd_dict_id,)
+                ).fetchone()
+                if row is None:
+                    missing.append(p.zstd_dict_id)
+            elif self.backend.get_dict(p.zstd_dict_id) is None:
+                missing.append(p.zstd_dict_id)
         if missing:
             raise MissingContent(
-                "dictionaries do not exist in this repository: " + ", ".join(missing)
+                "dictionaries do not exist in this repository: " + ", ".join(sorted(missing))
             )
 
     # -- novels / chapters ---------------------------------------------------
@@ -117,20 +163,37 @@ class Repository:
         if not self.backend.delete_novel(self._require_novel_id(novel_id), cascade=cascade):
             raise NotFound(f"novel {novel_id} not found")
 
+    @staticmethod
+    def _chapter_info(row: sqlite3.Row) -> ChapterInfo:
+        """Explicit per-column construction (E3): tolerant of future column
+        additions, loud on removals — unlike ``ChapterInfo(**dict(row))``,
+        which breaks on any new catalog column."""
+        return ChapterInfo(
+            id=int(row["id"]),
+            novel_id=int(row["novel_id"]),
+            order_key=row["order_key"],
+            blob_key=str(row["blob_key"]),
+            profile=str(row["profile"]),
+            media_type=row["media_type"],
+            charset=row["charset"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+        )
+
     def list_chapters(self, novel_id: int) -> list[ChapterInfo]:
         """Chapter catalog rows for a novel (no bodies); raises :class:`NotFound`
         for a missing novel, returns ``[]`` for a novel with no chapters."""
         novel_id = self._require_novel_id(novel_id)
         if self.backend.get_novel(novel_id) is None:
             raise NotFound(f"novel {novel_id} not found")
-        return [ChapterInfo(**dict(row)) for row in self.backend.list_chapters(novel_id)]
+        return [self._chapter_info(row) for row in self.backend.list_chapters(novel_id)]
 
     def get_chapter(self, chapter_id: int) -> ChapterInfo:
         """One chapter's catalog row; raises :class:`NotFound`."""
         row = self.backend.get_chapter(self._require_pk_public(chapter_id, "chapter_id"))
         if row is None:
             raise NotFound(f"chapter {chapter_id} not found")
-        return ChapterInfo(**dict(row))
+        return self._chapter_info(row)
 
     def delete_chapter(self, chapter_id: int) -> None:
         """Delete a chapter row + its metadata; raises :class:`NotFound`.
@@ -153,17 +216,16 @@ class Repository:
 
     @staticmethod
     def _require_pk_public(value: Any, label: str) -> int:
-        """Validate a primary-key argument (M16: int, not bool, non-negative)."""
-        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-            raise TypeError(f"{label} must be a non-negative int, got {type(value).__name__}")
-        return value
+        """Validate a primary-key argument (M16: int, not bool, non-negative).
+
+        Delegates to :func:`inkpack.types.require_pk` (E2: one validator).
+        """
+        return require_pk(value, label)
 
     @staticmethod
     def _require_novel_id(novel_id: Any) -> int:
         """Validate a novel id (M16: int, not bool, non-negative)."""
-        if isinstance(novel_id, bool) or not isinstance(novel_id, int) or novel_id < 0:
-            raise TypeError(f"novel_id must be a non-negative int, got {type(novel_id).__name__}")
-        return novel_id
+        return require_pk(novel_id, "novel_id")
 
     def upsert_chapter(
         self,
@@ -207,12 +269,15 @@ class Repository:
         novel_id = self._require_novel_id(novel_id)
         order_key = self._normalize_chapter_key(chapter_key)
         hints = hints or {}
+        _require_binary_stream(fp, "upsert_chapter_stream")  # A8
 
         def _run() -> Generator[OpEvent, None, int]:
             check_cancel(cancel)
             yield OpEvent(kind="start", op="put", phase="stream_hash")
-            with tempfile.SpooledTemporaryFile(max_size=2 * 1024 * 1024) as spool:
+            with tempfile.SpooledTemporaryFile(max_size=SPOOL_MAX_SIZE) as spool:
                 digest = yield from self.store.hash_stream_events(fp, spool, cancel)
+                # D6: one phase event at the hash→persist boundary.
+                yield OpEvent(kind="phase", op="put", phase="persist")
                 with self.backend.session() as s:
                     if s.query_one("SELECT 1 FROM novels WHERE id=?", (novel_id,)) is None:
                         raise NotFound(f"novel {novel_id} not found")
@@ -239,9 +304,39 @@ class Repository:
 
         return Operation(_run)
 
+    @staticmethod
+    def _shard_alias(s: Session, shard_id: int | None) -> str:
+        return s.alias_for(shard_id) if shard_id is not None else "p"
+
+    def _catalog_upsert(
+        self,
+        conn: sqlite3.Connection,
+        novel_id: int,
+        order_key: str,
+        prepared: PreparedPut,
+        hints: dict[str, Any],
+        meta: dict[str, Any] | None,
+        now: str,
+    ) -> int:
+        """Write the chapter catalog + metadata inside the caller's open
+        write transaction, then fire the pre-commit failpoint (H1/B3)."""
+        chapter_id = self.backend.upsert_chapter_catalog_on(
+            conn,
+            novel_id=novel_id,
+            order_key=order_key,
+            blob_key=prepared.blob_key,
+            profile=prepared.profile,
+            media_type=hints.get("media_type"),
+            charset=hints.get("charset"),
+            meta=meta,
+            now=now,
+        )
+        failpoint("upsert.pre_commit")  # inside the unified txn, pre-commit
+        return chapter_id
+
     def _upsert_prepared(
         self,
-        s: Any,
+        s: Session,
         novel_id: int,
         order_key: str,
         prepared: PreparedPut,
@@ -251,10 +346,12 @@ class Repository:
     ) -> int:
         """Commit content + chapter catalog + metadata on ONE session (M20).
 
-        The common path (healthy dedupe hit or new write) commits in a single
-        transaction; a missing payload with raw bytes available triggers the
-        shared repair flow (S2/H2) before the catalog row commits, so a
-        chapter never points at missing content.
+        Both the common path (healthy dedupe hit or new write) and the
+        repair path (a payload that vanished between prepare's probe and the
+        commit point, S2/H2) commit content + catalog in a SINGLE
+        transaction (B3): a chapter never commits pointing at missing
+        content, and no failure can leave a repaired payload without its
+        catalog row (or vice versa).
         """
         backend = self.backend
         now = backend.now()
@@ -279,35 +376,62 @@ class Repository:
                 s.conn,
                 write=True,
                 attach_shard_id=shard_id if (backend.mode == "sqlite_sharded" and shard_id is not None) else None,
+                session=s,
             ) as conn:
-                self.store.persist_prepared(conn, s, prepared, raw, now)
-                return backend.upsert_chapter_catalog_on(
-                    conn,
-                    novel_id=novel_id,
-                    order_key=order_key,
-                    blob_key=prepared.blob_key,
-                    profile=prepared.profile,
-                    media_type=hints.get("media_type"),
-                    charset=hints.get("charset"),
-                    meta=meta,
-                    now=now,
+                self.store.persist_prepared(
+                    conn, s, prepared, raw, now, alias=self._shard_alias(s, shard_id)
                 )
-        except RepairRequired:
+                return self._catalog_upsert(conn, novel_id, order_key, prepared, hints, meta, now)
+        except _RepairRequired:
             if raw is None:
                 raise
-            self.store.repair_flow(s, prepared, raw)
-            with backend.txn_on(s.conn, write=True) as conn:
-                return backend.upsert_chapter_catalog_on(
+            # B3: fold the repair INTO the catalog transaction. Re-fetch the
+            # row (it may have moved), encode under the STORED policy, rehome
+            # when the referenced shard is missing/NULL, then write content +
+            # catalog in one commit.
+            row = s.query_one(
+                "SELECT * FROM encodings WHERE blob_key=? AND profile=?",
+                (prepared.blob_key, prepared.profile),
+            )
+            if row is None:
+                # The encoding vanished under us (concurrent gc): transient
+                # contention, safe to retry the upsert (A6/B3).
+                raise Retryable(
+                    f"encoding for {(prepared.blob_key, prepared.profile)} vanished "
+                    "between prepare and persist; retry"
+                ) from None
+            enc = self.store.encode_with_stored_policy(s, row, raw)
+            self.store.check_blob_limit(enc.stored_len, s.conn)
+            shard_id = backend.resolve_write_shard(enc.stored_len, row["shard_id"])
+            if backend.mode == "sqlite_sharded":
+                s.forget_missing_shard(shard_id)
+            prepared = PreparedPut(
+                prepared.blob_key, prepared.raw_len, prepared.profile, enc, shard_id
+            )
+            with backend.txn_on(
+                s.conn,
+                write=True,
+                # shard_id is always a resolved int here (resolve_write_shard).
+                attach_shard_id=shard_id if backend.mode == "sqlite_sharded" else None,
+                session=s,
+            ) as conn:
+                backend.store_encoding_and_payload_on(
                     conn,
-                    novel_id=novel_id,
-                    order_key=order_key,
                     blob_key=prepared.blob_key,
+                    raw_len=prepared.raw_len,
+                    created_at=now,
                     profile=prepared.profile,
-                    media_type=hints.get("media_type"),
-                    charset=hints.get("charset"),
-                    meta=meta,
-                    now=backend.now(),
+                    codec=enc.codec,
+                    codec_params_json=enc.codec_params_json,
+                    zstd_dict_id=enc.zstd_dict_id,
+                    stored_len=enc.stored_len,
+                    checksum=None,
+                    shard_id=shard_id,
+                    updated_at=now,
+                    payload=enc.data,
+                    alias=self._shard_alias(s, shard_id),
                 )
+                return self._catalog_upsert(conn, novel_id, order_key, prepared, hints, meta, now)
 
     def _chapter_ref(self, chapter_id: int) -> ContentRef:
         row = self.backend.get_chapter(self._require_pk_public(chapter_id, "chapter_id"))
@@ -333,5 +457,11 @@ class Repository:
         return self.backend.meta_list(entity_type, entity_id)
 
     def iter_live_content(self, scope: int | None = None) -> Iterator[ContentRef]:
-        """Distinct content refs referenced by chapters (optionally one novel)."""
-        return self.backend.iter_chapter_refs(scope=scope)
+        """Distinct content refs referenced by chapters (optionally one novel).
+
+        Paged (C3): each page is a short read transaction, so the iterator is
+        **weakly consistent but monotone-safe for GC staging** — a concurrent
+        upsert may appear in a later page, and a ref deleted mid-drain may be
+        retained (safe over-retention); a live ref is never missed.
+        """
+        yield from self.backend.iter_chapter_refs(scope=scope)

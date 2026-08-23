@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
 dependencies = [
-    "zstandard>=0.22",
+    "zstandard>=0.22,<1",
 ]
 
 [project.optional-dependencies]
@@ -28,6 +28,11 @@ packages = ["inkpack"]
 [tool.pytest.ini_options]
 pythonpath = ["."]
 testpaths = ["tests"]
+# Bench-gated timing tests (C4) are excluded from the default run; they are
+# deterministic in structure but measure wall-clock, so opt in explicitly:
+#   python -m pytest -m slow
+addopts = "-m \"not slow\""
+markers = ["slow: bench-gated timing tests (excluded from the default run)"]
 
 [tool.mypy]
 python_version = "3.11"
@@ -38,6 +43,9 @@ exclude = ["tests/"]
 pythonVersion = "3.11"
 typeCheckingMode = "strict"
 exclude = ["tests"]
+# Resolve third-party types (zstandard) from the dev venv.
+venvPath = "."
+venv = ".venv"
 
 [tool.ruff]
 line-length = 120

@@ -54,7 +54,7 @@ def test_upsert_repairs_missing_payload_without_policy_migration(tmp_path, mode)
 
     info = repo.get_chapter(chapter_id)
     blob_key, profile = info.blob_key, info.profile
-    row0 = repo.backend.get_encoding(blob_key, profile)
+    row0 = enc_row(repo, ContentRef(blob_key, profile))
     codec0 = str(row0["codec"])
     params0 = str(row0["codec_params_json"])
 
@@ -67,7 +67,7 @@ def test_upsert_repairs_missing_payload_without_policy_migration(tmp_path, mode)
     repo.upsert_chapter(novel_id, "ch-1", body, "zstd_nodict")
 
     assert repo.get_chapter_bytes(chapter_id) == body
-    row1 = repo.backend.get_encoding(blob_key, profile)
+    row1 = enc_row(repo, ContentRef(blob_key, profile))
     assert str(row1["codec"]) == codec0
     assert str(row1["codec_params_json"]) == params0
     assert_repo_consistent(repo)
@@ -93,7 +93,7 @@ def test_backend_open_sharded_does_not_create_payload_dir(tmp_path):
 
 def test_get_bytes_missing_shard_file_does_not_create(repo_sharded):
     put = repo_sharded.store.put_bytes(b"x" * 100, "raw").result
-    row = repo_sharded.backend.get_encoding(put.ref.blob_key, put.ref.profile)
+    row = enc_row(repo_sharded, put.ref)
     shard_path = repo_sharded.backend.shard_path(int(row["shard_id"]))
 
     before = set(repo_sharded.backend.payload_dir.glob("shard-*.sqlite"))
@@ -127,19 +127,19 @@ def test_gc_deletes_encodings_with_null_shard_id(repo_sharded):
         )
     gc = repo_sharded.store.gc(live=[]).result
     assert gc.encodings_deleted == 1
-    assert repo_sharded.backend.get_encoding(put.ref.blob_key, put.ref.profile) is None
+    assert enc_row(repo_sharded, put.ref) is None
     assert_repo_consistent(repo_sharded)
 
 
 def test_gc_deletes_encoding_if_shard_file_missing(repo_sharded):
     put = repo_sharded.store.put_bytes(b"dead-missing-file", "raw").result
-    row = repo_sharded.backend.get_encoding(put.ref.blob_key, put.ref.profile)
+    row = enc_row(repo_sharded, put.ref)
     shard_path = repo_sharded.backend.shard_path(int(row["shard_id"]))
     shard_path.unlink()
 
     gc = repo_sharded.store.gc(live=[]).result
     assert gc.encodings_deleted == 1
-    assert repo_sharded.backend.get_encoding(put.ref.blob_key, put.ref.profile) is None
+    assert enc_row(repo_sharded, put.ref) is None
     assert not shard_path.exists()  # never recreated
     assert_repo_consistent(repo_sharded)
 
@@ -156,13 +156,13 @@ def test_gc_repairs_mixed_shard_locations(repo_sharded):
             "UPDATE encodings SET shard_id=NULL WHERE blob_key=? AND profile=?",
             (nulled.blob_key, nulled.profile),
         )
-    row = repo_sharded.backend.get_encoding(missing_file.blob_key, missing_file.profile)
+    row = enc_row(repo_sharded, missing_file)
     repo_sharded.backend.shard_path(int(row["shard_id"])).unlink()
 
     gc = repo_sharded.store.gc(live=[good]).result
     assert gc.encodings_deleted == 2
-    assert repo_sharded.backend.get_encoding(nulled.blob_key, nulled.profile) is None
-    assert repo_sharded.backend.get_encoding(missing_file.blob_key, missing_file.profile) is None
+    assert enc_row(repo_sharded, nulled) is None
+    assert enc_row(repo_sharded, missing_file) is None
     assert repo_sharded.store.get_bytes(good) == b"good" * 300_000
     assert_repo_consistent(repo_sharded)
 
@@ -176,7 +176,7 @@ def test_null_shard_id_repair_rehomes(repo_sharded):
     encodings.shard_id is updated in the same transaction. No raw sqlite
     errors, no junk shard."""
     put = repo_sharded.store.put_bytes(b"z" * 100, "raw").result
-    row = repo_sharded.backend.get_encoding(put.ref.blob_key, put.ref.profile)
+    row = enc_row(repo_sharded, put.ref)
     with repo_sharded.backend.txn(write=True, attach_shard_id=int(row["shard_id"])) as conn:
         conn.execute(
             "DELETE FROM p.payload WHERE blob_key=? AND profile=?",
@@ -189,7 +189,7 @@ def test_null_shard_id_repair_rehomes(repo_sharded):
         )
     # Repair via rehoming: succeeds, locator repaired, content readable.
     repaired = repo_sharded.store.put_bytes(b"z" * 100, "raw").result
-    row_after = repo_sharded.backend.get_encoding(repaired.ref.blob_key, repaired.ref.profile)
+    row_after = enc_row(repo_sharded, repaired.ref)
     assert row_after["shard_id"] is not None
     assert repo_sharded.backend.shard_path(int(row_after["shard_id"])).exists()
     assert repo_sharded.store.get_bytes(repaired.ref) == b"z" * 100

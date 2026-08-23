@@ -1,2 +1,2 @@
 # Runtime dependencies for Inkpack
-zstandard>=0.22
+zstandard>=0.22,<1  # pinned: one-shot zstd API share-safety (C2)

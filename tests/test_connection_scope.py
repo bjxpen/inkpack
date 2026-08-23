@@ -25,6 +25,9 @@ def test_verify_connects_not_per_row(repo, connect_counter):
     connect_counter["opens"] = 0
     verify = repo.store.verify().result
     assert verify.checked == 20
+    # C1: O(1) connections (one session connection, plus at most the
+    # blob-limit probe); sharded attaches ride on that session (O(shards)
+    # attaches, not O(rows)) — see test_r2_performance for the attach bound.
     assert connect_counter["opens"] <= 2  # O(1), not O(rows)
 
 
@@ -64,7 +67,11 @@ def test_get_bytes_does_not_hold_connection(repo, connect_counter):
 def test_put_connects_once(repo, connect_counter):
     connect_counter["opens"] = 0
     put = repo.store.put_bytes(b"one-conn", profile="raw").result
-    # put = one session connection; the write txn reuses it (no second connect).
+    # G4 annotation: `== 1` holds because the blob-length probe is
+    # SESSION-PLUMBED — check_blob_limit runs on the session connection
+    # (backend.blob_length_limit(conn=s.conn)) instead of opening a dedicated
+    # probe connection. A regression to a per-call probe connection would
+    # make this 2.
     assert connect_counter["opens"] == 1
     assert repo.store.get_bytes(put.ref) == b"one-conn"
 
@@ -95,6 +102,11 @@ def test_verify_limit_stops_across_pages(repo, monkeypatch):
 
 
 def test_dict_cached_within_verify(repo, monkeypatch):
+    """G1: the dict-cache property is OBSERVABLE — a 10-row verify fetches
+    the dictionary bytes exactly once (the old spy watched
+    ``backend.get_dict``, which verify never calls: vacuous)."""
+    from inkpack.sqlite import Session
+
     train = repo.store.train_dict([b"cache-dict " * 60] * 6).result
     repo.set_profile(Profile(name="zstd_dict", codec="zstd", params={}, zstd_dict_id=train.dict_id))
     data = b"cache-dict " * 200
@@ -103,17 +115,20 @@ def test_dict_cached_within_verify(repo, monkeypatch):
         # Distinct content (different suffixes) but all compressed with the dict.
         body = data + bytes([i]) * 7
         refs.append(repo.store.put_bytes(body, profile="zstd_dict").result.ref)
+    # Instrument the actual FETCH (the dicts query), not the cached accessor:
+    # dict_bytes is called per row, but the underlying query must run once.
     calls = {"n": 0}
-    original = repo.backend.get_dict
+    original = Session.query_one
 
-    def spy(dict_id):
-        calls["n"] += 1
-        return original(dict_id)
+    def spy(self, sql, params=()):
+        if "FROM dicts" in sql:
+            calls["n"] += 1
+        return original(self, sql, params)
 
-    monkeypatch.setattr(repo.backend, "get_dict", spy)
+    monkeypatch.setattr(Session, "query_one", spy)
     verify = repo.store.verify().result
     assert verify.ok == 10
-    assert calls["n"] <= 1  # dict bytes fetched once for the whole operation
+    assert calls["n"] == 1  # dict bytes fetched once for the whole operation
 
 
 # -- §18 operation-local snapshots ----------------------------------------------
