@@ -1468,11 +1468,21 @@ class SqliteBackend:
         Paged keyset iteration (C3): each page of 1000 rows is its own short
         read transaction (the ``idx_chapters_blob_profile`` index serves the
         ORDER BY), so a bulk drain never holds a read txn for its whole
-        duration. Consistency contract: **weakly consistent, monotone-safe
-        for GC staging** — a page boundary can capture late additions in a
-        later page and can retain refs deleted mid-drain (over-retention,
-        safe for GC), but it can never miss a live ref (refs are only ever
-        added between pages for the pairs that matter to GC).
+        duration.
+
+        Visibility: **at least that of a single-snapshot fetch taken at
+        drain start** — a row present at the first page's snapshot sits at a
+        fixed key, and the ascending keyset sweep cannot skip it, even under
+        concurrent writers; late additions whose key sorts above the cursor
+        appear in a later page; mid-drain deletions cause over-retention
+        (safe for GC, which deletes what is *not* in the live set). Refs
+        added mid-drain below the cursor are missed by that drain exactly as
+        a start-of-drain snapshot would miss them.
+
+        Live-set freshness obligation (normative for callers): the exposure
+        window is **commits during or after the drain** — such chapters are
+        not represented in the result, and ``gc`` will reclaim their content
+        (recovery: re-run the upsert). See GUARANTEES.md.
         """
         scope = _require_scope(scope)
         last: tuple[str, str] | None = None

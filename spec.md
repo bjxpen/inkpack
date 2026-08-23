@@ -388,7 +388,10 @@ window. Normative: *GC's deadness snapshot and deletions share one exclusive
 writer window per batch; concurrent writers block (`Busy`) for the batch
 duration; a put completing before a batch's snapshot is authorizable for
 collection in that or a later batch.* Cancellation keeps committed batches
-and rolls the in-flight batch back whole.
+and rolls the in-flight batch back whole. The live-set freshness rule is
+normative for callers (the exposure window is commits during or after the
+drain — see GUARANTEES.md), so the exclusive window alone is not the whole
+safety story.
 
 ### 10.3 compact()
 Default repo policy: `auto_vacuum=NONE` (optimal for fast writes).

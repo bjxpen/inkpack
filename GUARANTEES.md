@@ -138,11 +138,26 @@ the r2 issue register).
 
 ## Streaming reads (C3)
 
-`iter_live_content()` pages 1000 rows per short read transaction (keyset on
-`(blob_key, profile)`). It is **weakly consistent but monotone-safe for GC
-staging**: a page boundary can capture late additions in a later page and can
-retain refs deleted mid-drain (over-retention — safe for GC, which deletes
-what is *not* in the live set), but it can never miss a live ref.
+### Visibility (C3)
+
+`iter_live_content()` pages 1000 rows per short read transaction. Visibility
+is **at least that of a single-snapshot fetch taken at drain start**: late
+additions whose key sorts above the cursor appear in a later page; deletions
+mid-drain cause over-retention (safe for GC); with no concurrent writers the
+result equals a monolithic snapshot. Refs added mid-drain below the cursor
+are missed by that drain exactly as a start-of-drain snapshot would miss them.
+
+### Live-set freshness requirement
+
+`iter_live_content()` captures every chapter that exists when the drain
+starts — even with concurrent writers (the keyset sweep cannot skip a row
+that was already present). The exposure window is therefore **commits during
+or after the drain**: a chapter committed mid-drain whose ref sorts at or
+below the cursor, or any chapter committed once `live` has been handed to
+`gc`, is not represented, and GC will reclaim its content (recovery:
+re-run the upsert). Operational rule: run `gc(live=iter_live_content())`
+with no concurrent chapter writers, or re-derive `live` and re-run GC after
+writers quiesce.
 
 ---
 

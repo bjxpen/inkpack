@@ -444,10 +444,16 @@ DBs). Key invariants:
   (r3-A). Cancellation keeps committed batches; the in-flight batch rolls
   back whole. Then orphan `blobs`, then unreferenced `dicts`. See
   [GUARANTEES.md](GUARANTEES.md).
-- `iter_live_content()` is **weakly consistent but monotone-safe for GC
-  staging** (C3): it pages 1000 rows per short read transaction, so a page
-  boundary can capture late additions in a later page and retain refs deleted
-  mid-drain (safe over-retention), but can never miss a live ref.
+- `iter_live_content()` pages 1000 rows per short read transaction (C3).
+  Visibility is **at least that of a single-snapshot fetch taken at drain
+  start** — every chapter existing when the drain starts is captured even
+  under concurrent writers; late additions above the cursor appear in a
+  later page; mid-drain deletions cause safe over-retention. The exposure
+  window is **commits during or after the drain**: such chapters are not
+  represented in `live`, and GC will reclaim their content (recovery:
+  re-run the upsert) — run `gc(live=iter_live_content())` with no
+  concurrent chapter writers, or re-derive `live` after writers quiesce
+  (see [GUARANTEES.md](GUARANTEES.md)).
 - Schema versioning: `PRAGMA user_version` tracks the index schema;
   forward-only, idempotent migrations (`inkpack/sqlite.py::MIGRATIONS`).
 
