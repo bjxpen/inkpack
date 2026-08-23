@@ -193,6 +193,28 @@ class GcResult:
 
 
 @dataclass(frozen=True)
+class GcBatchSummary:
+    """Per-batch GC progress summary (r4-P3.1), yielded by
+    ``SqliteBackend.gc_iter`` after each batch's commit.
+
+    ``index`` is the 1-based batch number; ``batches`` is the total batch
+    count; ``shards`` is the tuple of shard ids in this batch (``()`` for a
+    single-mode run, where the "batch" is the main DB); ``encodings_deleted``
+    and ``payload_rows_deleted`` are CUMULATIVE through this batch. A final
+    summary with ``index == 0`` carries the full-run totals (including the
+    final convergence sweep) and is NOT a batch item — it carries the totals
+    only (blobs/dicts are reclaimed by the caller after the iterator
+    exhausts).
+    """
+
+    index: int
+    batches: int
+    shards: tuple[int, ...]
+    encodings_deleted: int
+    payload_rows_deleted: int
+
+
+@dataclass(frozen=True)
 class CompactResult:
     mode: str
     targets: list[str]

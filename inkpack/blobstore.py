@@ -17,7 +17,7 @@ import json
 import sqlite3
 import tempfile
 from collections.abc import Generator, Iterable, Iterator
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import IO, Any, BinaryIO, cast
 
 from .codec import (
@@ -1151,18 +1151,33 @@ class BlobStore:
     def gc(self, live: Iterable[ContentRef], cancel: CancelToken | None = None) -> Operation[GcResult]:
         """Delete encodings/payloads not in ``live``, then orphan blobs and dicts.
 
-        Emits only ``start``/``done`` (per-batch ``item`` events land with
-        P3.1). The per-batch exclusive window can be long for large dead
-        sets — see the GUARANTEES.md duration note; cancel between batches
-        keeps committed batches.
+        Emits a per-batch ``item`` event (r4-P3.1) after each batch's commit,
+        carrying the cumulative ``encodings_deleted``/``payload_rows_deleted``
+        totals, the 1-based batch ``index``, the total ``batches``, and the
+        batch's ``shards`` — then a ``done`` event with the full-run totals
+        (including the final convergence sweep and the reclaimed orphan
+        blobs / unreferenced dicts). The per-batch exclusive window can be
+        long for large dead sets — see the GUARANTEES.md duration note;
+        cancel between batches keeps committed batches.
         """
 
         def _run() -> Generator[OpEvent, None, GcResult]:
             check_cancel(cancel)
             yield OpEvent(kind="start", op="gc")
-            encodings_deleted, payload_rows_deleted, blobs_deleted, dicts_deleted = self.backend.gc(
-                live, cancel
-            )
+            encodings_deleted = 0
+            payload_rows_deleted = 0
+            for summary in self.backend.gc_iter(live, cancel):
+                if summary.index == 0:  # final totals sentinel (not a batch item)
+                    encodings_deleted = summary.encodings_deleted
+                    payload_rows_deleted = summary.payload_rows_deleted
+                else:
+                    yield OpEvent(kind="item", op="gc", metrics=asdict(summary))
+            # Orphan blobs + unreferenced dicts are reclaimed only AFTER every
+            # batch has committed (and the final convergence sweep): each
+            # delete is its own atomic txn and is safe against the puts a
+            # committed batch authorized.
+            blobs_deleted = self.backend.delete_orphan_blobs()
+            dicts_deleted = self.backend.delete_unreferenced_dicts()
             result = GcResult(
                 encodings_deleted=encodings_deleted,
                 payload_rows_deleted=payload_rows_deleted,

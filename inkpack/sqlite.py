@@ -31,6 +31,7 @@ from .types import (
     Clock,
     ContentRef,
     CorruptContent,
+    GcBatchSummary,
     InkpackError,
     MissingContent,
     NotFound,
@@ -1615,11 +1616,17 @@ class SqliteBackend:
                 check_cancel(cancel)
         flush()
 
-    def gc(
+    def gc_iter(
         self, live: Iterable[ContentRef], cancel: CancelToken | None = None
-    ) -> tuple[int, int, int, int]:
-        """Delete dead encodings + payloads, then orphan blobs + dicts;
-        returns ``(encodings, payloads, blobs, dicts)``.
+    ) -> Iterator[GcBatchSummary]:
+        """Generator: run the batched gc, yielding a :class:`GcBatchSummary`
+        after EACH batch's commit (``index`` 1..N, cumulative counts), then a
+        FINAL summary (``index == 0``) carrying the full-run totals (including
+        the final convergence sweep). The final summary is NOT a batch item —
+        it carries the totals only. Does NOT delete orphan blobs /
+        unreferenced dicts (the caller does those after the iterator
+        exhausts, so it can build the ``GcResult``). Never yields from inside
+        an exclusive window (consumer code never runs under the lock).
 
         **Batched exclusive windows** (Decision G amendment, B1). The live
         set is staged once (autocommit), then each batch of up to
@@ -1682,8 +1689,11 @@ class SqliteBackend:
                     }
                     pending = sorted(set(self.list_shards()) | referenced)
                 batch_size = self._gc_batch_size(s)
+                total_batches = (len(pending) + batch_size - 1) // batch_size
+                batch_num = 0
                 for i0 in range(0, len(pending), batch_size):
                     batch = pending[i0 : i0 + batch_size]
+                    batch_num += 1
                     check_cancel(cancel)
                     aliases: list[tuple[str, int]] = []
                     try:
@@ -1766,48 +1776,91 @@ class SqliteBackend:
                         for _alias, sid in aliases:
                             s.detach(sid)
                     check_cancel(cancel)
+                    # r4-P3.1: yield the per-batch summary (cumulative counts,
+                    # 1-based index, total batches, this batch's shards) AFTER
+                    # the batch's commit — never from inside the exclusive
+                    # window.
+                    yield GcBatchSummary(
+                        index=batch_num,
+                        batches=total_batches,
+                        shards=tuple(int(sid) for sid in batch if sid is not None),
+                        encodings_deleted=encodings_deleted,
+                        payload_rows_deleted=payload_rows_deleted,
+                    )
+                # r3-A: one-run convergence. A shard swept in an EARLIER batch
+                # may hold an orphan copy whose encoding died in a LATER batch
+                # — that batch's restricted sweep saw the encoding still alive,
+                # and the earlier shard is never revisited. One final idempotent
+                # sweep over the whole shard universe removes any payload whose
+                # encoding died in another batch. Safe WITHOUT an exclusive
+                # window: a concurrently-committing put writes encoding+payload
+                # atomically, so the sweep's statement snapshot sees
+                # both-or-neither and never sweeps a live put's row. Skipped for
+                # single-batch runs — the in-batch sweep already covered the
+                # whole universe there (the common small-repo case pays zero).
+                # (r4-P3.1: the final sweep is NOT a batch item — its
+                # deletions accumulate into the final totals yield below.)
+                if self.mode == "sqlite_sharded" and batch_size < len(pending):
+                    for sid in self.list_shards():
+                        check_cancel(cancel)
+                        try:
+                            alias = s.attach(sid)
+                        except MissingContent:
+                            continue  # r3-D: vanished mid-run — encodings-only
+                        try:
+                            s.conn.execute("BEGIN IMMEDIATE")
+                            payload_rows_deleted += s.execute(
+                                f"DELETE FROM {alias}.payload WHERE NOT EXISTS ("
+                                f"SELECT 1 FROM encodings e WHERE e.blob_key = "
+                                f"{alias}.payload.blob_key "
+                                f"AND e.profile = {alias}.payload.profile)"
+                            )
+                            s.conn.commit()
+                        except BaseException:
+                            with suppress(sqlite3.Error):
+                                s.conn.rollback()
+                            raise
+                        finally:
+                            s.detach(sid)
+                # r4-P3.1: final totals summary (index=0 sentinel). Carries the
+                # full-run encodings/payloads totals (including the final
+                # sweep). The caller reclaims orphan blobs + unreferenced dicts
+                # AFTER this (so the final sweep's orphans are seen).
+                yield GcBatchSummary(
+                    index=0,
+                    batches=total_batches,
+                    shards=(),
+                    encodings_deleted=encodings_deleted,
+                    payload_rows_deleted=payload_rows_deleted,
+                )
             finally:
                 s.execute("DROP TABLE IF EXISTS temp_live")
                 s.execute("DROP TABLE IF EXISTS temp_dead")
-            # r3-A: one-run convergence. A shard swept in an EARLIER batch may
-            # hold an orphan copy whose encoding died in a LATER batch — that
-            # batch's restricted sweep saw the encoding still alive, and the
-            # earlier shard is never revisited. One final idempotent sweep
-            # over the whole shard universe removes any payload whose encoding
-            # died in another batch. Safe WITHOUT an exclusive window: a
-            # concurrently-committing put writes encoding+payload atomically,
-            # so the sweep's statement snapshot sees both-or-neither and never
-            # sweeps a live put's row. Skipped for single-batch runs — the
-            # in-batch sweep already covered the whole universe there (the
-            # common small-repo case pays zero).
-            if self.mode == "sqlite_sharded" and batch_size < len(pending):
-                for sid in self.list_shards():
-                    check_cancel(cancel)
-                    try:
-                        alias = s.attach(sid)
-                    except MissingContent:
-                        continue  # r3-D: vanished mid-run — encodings-only
-                    try:
-                        s.conn.execute("BEGIN IMMEDIATE")
-                        payload_rows_deleted += s.execute(
-                            f"DELETE FROM {alias}.payload WHERE NOT EXISTS ("
-                            f"SELECT 1 FROM encodings e WHERE e.blob_key = "
-                            f"{alias}.payload.blob_key "
-                            f"AND e.profile = {alias}.payload.profile)"
-                        )
-                        s.conn.commit()
-                    except BaseException:
-                        with suppress(sqlite3.Error):
-                            s.conn.rollback()
-                        raise
-                    finally:
-                        s.detach(sid)
-            # Orphan blobs and unreferenced dicts are reclaimed only AFTER
-            # every batch has committed (and the final sweep): each delete is
-            # its own atomic txn and is safe against the puts a committed
-            # batch authorized.
-            blobs_deleted = self.delete_orphan_blobs()
-            dicts_deleted = self.delete_unreferenced_dicts()
+
+    def gc(
+        self, live: Iterable[ContentRef], cancel: CancelToken | None = None
+    ) -> tuple[int, int, int, int]:
+        """Delete dead encodings + payloads, then orphan blobs + dicts;
+        returns ``(encodings, payloads, blobs, dicts)``.
+
+        Thin wrapper over :meth:`gc_iter` (which yields per-batch summaries
+        and reclaims the dead encodings/payloads): this wrapper consumes the
+        iterator, then reclaims orphan blobs + unreferenced dicts (each its
+        own atomic txn, safe against the puts a committed batch authorized),
+        and returns the full-run totals. See :meth:`gc_iter` for the batched
+        exclusive-window invariants.
+        """
+        encodings_deleted = 0
+        payload_rows_deleted = 0
+        for summary in self.gc_iter(live, cancel):
+            if summary.index == 0:  # final totals sentinel
+                encodings_deleted = summary.encodings_deleted
+                payload_rows_deleted = summary.payload_rows_deleted
+        # Orphan blobs and unreferenced dicts are reclaimed only AFTER every
+        # batch has committed (and the final sweep): each delete is its own
+        # atomic txn and is safe against the puts a committed batch authorized.
+        blobs_deleted = self.delete_orphan_blobs()
+        dicts_deleted = self.delete_unreferenced_dicts()
         return encodings_deleted, payload_rows_deleted, blobs_deleted, dicts_deleted
 
     def delete_orphan_blobs(self) -> int:

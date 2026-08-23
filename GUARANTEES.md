@@ -38,6 +38,15 @@ exclusive windows**:
   vanished shard's rows are reclaimed without recreating anything. A shard
   file that vanishes between the pre-check and the attach degrades that
   shard to an encodings-only pass; it never aborts the run.
+- **Per-batch progress (r4-P3.1).** After each batch's commit + detach,
+  `gc` yields an `item` event carrying the 1-based batch `index`, the
+  total `batches`, the batch's `shards`, and the CUMULATIVE
+  `encodings_deleted` / `payload_rows_deleted` — never from inside the
+  exclusive window, so consumer code between batches runs without the
+  writer lock. The final convergence sweep is NOT a batch item: its
+  deletions appear only in the final `done` / result totals, together with
+  the orphan blobs and unreferenced dicts reclaimed after the iterator
+  exhausts.
 
 **Cancellation** keeps committed batches and rolls the in-flight batch back
 whole. **Duration note:** a batch's writer lock is held for the whole
