@@ -22,18 +22,22 @@ exclusive windows**:
   never recreated) → sweep wrong-shard payloads → **one `COMMIT`** →
   `DETACH`.
 
-**Invariant:** *GC deletes exactly the encodings dead as of a snapshot taken
-after any concurrent put completed.*
-
-- A put that **completed before** a batch's snapshot is visible to it —
-  authorizable for collection in that or a later batch.
-- A put that **races** the window blocks on the reserved lock until the
-  batch commits; it is absent from the snapshot, and its in-txn re-probes see
-  the post-commit state (a put whose row was deleted re-prepares as a new
-  write and succeeds — it self-heals).
-- Cross-batch residue is impossible: anything batch *k* cannot see is caught
-  by batch *k+1*'s `NOT EXISTS` sweep (its encoding is gone by then, so the
-  payload is an orphan by definition).
+- **Two invariants, stated separately.**
+  *Encoding-deletion:* GC deletes exactly the encodings dead as of a batch
+  snapshot taken after any concurrent put completed — a put completing before
+  the snapshot is authorizable there or in a later batch; a put racing the
+  window blocks, lands after commit, and self-heals.
+  *Orphan-payload cleanup:* each batch sweeps its own shards; a **final
+  idempotent sweep** over the whole shard universe then removes any payload
+  whose encoding died in another batch, so one GC run always converges to
+  "no payload rows without matching encodings." The sweep needs no exclusive
+  window: a committing put writes encoding+payload atomically, so the sweep's
+  statement snapshot sees both or neither.
+- **Batch universe.** The batch universe is the union of on-disk canonical
+  shards and every shard id still referenced by `encodings.shard_id` — a
+  vanished shard's rows are reclaimed without recreating anything. A shard
+  file that vanishes between the pre-check and the attach degrades that
+  shard to an encodings-only pass; it never aborts the run.
 
 **Cancellation** keeps committed batches and rolls the in-flight batch back
 whole. **Duration note:** a batch's writer lock is held for the whole
@@ -122,6 +126,9 @@ the r2 issue register).
   GC's TEMP tables live for the whole operation.
 - **`compact()`** VACUUMs each database on a virgin connection with no
   attached databases (decision H).
+- **Open-time shard validation** (C4) runs concurrently over the shard
+  files; failures are deterministic — the lowest failing shard id's error is
+  raised.
 - **Repository catalog calls** (novels/chapters/meta, `set_profile(s)`,
   `set_verify_on_read`) each open their own short connection; a multi-step UI
   flow paying per-op connection cost can be revisited only on profiling

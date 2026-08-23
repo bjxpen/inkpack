@@ -31,6 +31,11 @@ from .conftest import assert_repo_consistent, enc_row, payload_bytes
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def _norm(text: str) -> str:
+    """Collapse whitespace so the guards pin WORDING, not markdown line-wraps."""
+    return re.sub(r"\s+", " ", text)
+
+
 # ---------------------------------------------------------------------------
 # A — GC cross-batch wrong-shard residue: one-run convergence
 # ---------------------------------------------------------------------------
@@ -105,8 +110,8 @@ def test_guarantees_state_live_set_freshness_and_honest_visibility():
     """The docs are contract: the exposure window must be stated where it
     actually is, and the "never miss a live ref" overclaim must be gone
     everywhere."""
-    guarantees = (ROOT / "GUARANTEES.md").read_text()
-    readme = (ROOT / "README.md").read_text()
+    guarantees = _norm((ROOT / "GUARANTEES.md").read_text())
+    readme = _norm((ROOT / "README.md").read_text())
     # The exposure window must be stated where it actually is…
     assert "commits during or after the drain" in guarantees
     # …and the overclaim must be gone everywhere.
@@ -218,7 +223,7 @@ def test_gc_degrades_to_encodings_only_when_attach_races_a_vanish(repo_sharded, 
 
 
 def test_guarantees_documents_batch_universe_and_open_determinism():
-    text = (ROOT / "GUARANTEES.md").read_text()
+    text = _norm((ROOT / "GUARANTEES.md").read_text())
     assert "union of on-disk canonical shards" in text  # batch universe
     assert "lowest failing shard id" in text  # C4 determinism
 

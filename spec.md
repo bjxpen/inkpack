@@ -542,6 +542,12 @@ wrote"):
   - delete the batch's shard `payload` rows for dead refs
   - delete the corresponding `encodings` rows in index
   - sweep payloads parked at the wrong shard (batch-restricted)
+- Per-batch sweeps cover only that batch's shards, so a FINAL IDEMPOTENT
+  SWEEP over the whole shard universe runs after the batch loop (multi-batch
+  runs only), removing any payload whose encoding died in another batch —
+  one GC run always converges to "no payload rows without matching
+  encodings" (r3-A; the sweep needs no exclusive window: a committing put
+  writes encoding+payload atomically)
 - Cancellation keeps committed batches; the in-flight batch rolls back whole
 
 **Concurrency contract (normative):** GC's deadness snapshot and deletions
@@ -762,4 +768,6 @@ decode). A present-but-corrupt payload is NOT decoded on the dedupe-hit path.
 **N8 — GC computes `temp_dead` freshly PER BATCH inside that batch's
 exclusive writer window (see the G amendment); a racing writer blocks on the
 window. GC additionally sweeps payloads parked at a shard different from
-their `encodings.shard_id` locator (wrong-shard orphans).**
+their `encodings.shard_id` locator (wrong-shard orphans), per batch AND via
+the final whole-universe idempotent sweep on multi-batch runs, so one GC run
+converges to no orphan payload rows (r3-A).**

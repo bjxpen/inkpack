@@ -1565,17 +1565,27 @@ class SqliteBackend:
            payloads are cleaned from every batch shard; a vanished shard
            file yields an encodings-only delete — no file is ever created);
         5. sweep payloads parked at the wrong shard (Issue 18);
-        6. commit — one atomic commit per batch; DETACH.
+        6. commit — one atomic commit per batch; DETACH;
+        7. (multi-batch runs only) one final idempotent whole-universe
+           orphan sweep so the run converges (r3-A).
 
-        Invariant: *gc deletes exactly the encodings dead as of a snapshot
-        taken after any concurrent put completed.* A put that finishes before
-        a batch's snapshot is visible to it (authorizable there or in a later
-        batch); a put racing the window blocks until commit, is absent from
-        the snapshot, and re-probes inside its own txn (self-healing as a new
-        write). Cross-batch residue is impossible: anything batch *k*'s
-        sweep cannot see is caught by batch *k+1*'s ``NOT EXISTS`` sweep
-        (its encoding is gone by then, so the payload is an orphan by
-        definition).
+        Two invariants, stated separately:
+        *Encoding-deletion:* gc deletes exactly the encodings dead as of a
+        batch snapshot taken after any concurrent put completed — a put
+        completing before the snapshot is authorizable there or in a later
+        batch; a put racing the window blocks, lands after commit, and
+        self-heals on its in-txn re-probe.
+        *Orphan-payload cleanup:* each batch sweeps its own shards; a FINAL
+        IDEMPOTENT SWEEP over the whole shard universe (multi-batch runs
+        only) then removes any payload whose encoding died in another batch,
+        so one GC run always converges to "no payload rows without matching
+        encodings" (r3-A — the batch-restricted sweep alone left cross-batch
+        residue for copies parked in EARLIER batches than their locator).
+        The final sweep needs no exclusive window: a committing put writes
+        encoding+payload atomically, so the sweep's statement snapshot sees
+        both or neither. A shard file vanishing between the exists()
+        pre-check and attach degrades to an encodings-only pass (r3-D),
+        never aborting the run.
 
         Cancellation keeps committed batches; the in-flight batch rolls back
         whole.
@@ -1610,7 +1620,15 @@ class SqliteBackend:
                                 continue  # single mode: the main DB holds payloads
                             if not self.shard_path(sid).exists():
                                 continue  # vanished shard -> encodings-only
-                            aliases.append((s.attach(sid), sid))
+                            try:
+                                aliases.append((s.attach(sid), sid))
+                            except MissingContent:
+                                # r3-D: the file vanished in the window between
+                                # the exists() pre-check and attach()'s
+                                # re-check — degrade to the encodings-only pass
+                                # (the enc_sids re-check below sees it gone),
+                                # never abort the whole run.
+                                continue
                         try:
                             s.conn.execute("BEGIN IMMEDIATE")
                         except sqlite3.Error as exc:
@@ -1679,9 +1697,43 @@ class SqliteBackend:
             finally:
                 s.execute("DROP TABLE IF EXISTS temp_live")
                 s.execute("DROP TABLE IF EXISTS temp_dead")
+            # r3-A: one-run convergence. A shard swept in an EARLIER batch may
+            # hold an orphan copy whose encoding died in a LATER batch — that
+            # batch's restricted sweep saw the encoding still alive, and the
+            # earlier shard is never revisited. One final idempotent sweep
+            # over the whole shard universe removes any payload whose encoding
+            # died in another batch. Safe WITHOUT an exclusive window: a
+            # concurrently-committing put writes encoding+payload atomically,
+            # so the sweep's statement snapshot sees both-or-neither and never
+            # sweeps a live put's row. Skipped for single-batch runs — the
+            # in-batch sweep already covered the whole universe there (the
+            # common small-repo case pays zero).
+            if self.mode == "sqlite_sharded" and batch_size < len(pending):
+                for sid in self.list_shards():
+                    check_cancel(cancel)
+                    try:
+                        alias = s.attach(sid)
+                    except MissingContent:
+                        continue  # r3-D: vanished mid-run — encodings-only
+                    try:
+                        s.conn.execute("BEGIN IMMEDIATE")
+                        payload_rows_deleted += s.execute(
+                            f"DELETE FROM {alias}.payload WHERE NOT EXISTS ("
+                            f"SELECT 1 FROM encodings e WHERE e.blob_key = "
+                            f"{alias}.payload.blob_key "
+                            f"AND e.profile = {alias}.payload.profile)"
+                        )
+                        s.conn.commit()
+                    except BaseException:
+                        with suppress(sqlite3.Error):
+                            s.conn.rollback()
+                        raise
+                    finally:
+                        s.detach(sid)
             # Orphan blobs and unreferenced dicts are reclaimed only AFTER
-            # every batch has committed: each delete is its own atomic txn and
-            # is safe against the puts a committed batch authorized.
+            # every batch has committed (and the final sweep): each delete is
+            # its own atomic txn and is safe against the puts a committed
+            # batch authorized.
             blobs_deleted = self.delete_orphan_blobs()
             dicts_deleted = self.delete_unreferenced_dicts()
         return encodings_deleted, payload_rows_deleted, blobs_deleted, dicts_deleted

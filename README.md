@@ -438,9 +438,12 @@ DBs). Key invariants:
   the attach-limit shards runs one `BEGIN IMMEDIATE … COMMIT` that
   recomputes the dead set fresh inside the window, so a put that completed
   before a batch's snapshot is authorizable, and a put racing the window
-  blocks, is absent from the snapshot, and self-heals. Cancellation keeps
-  committed batches; the in-flight batch rolls back whole. Then orphan
-  `blobs`, then unreferenced `dicts`. See [GUARANTEES.md](GUARANTEES.md).
+  blocks, is absent from the snapshot, and self-heals. On multi-batch runs a
+  **final idempotent sweep** over the whole shard universe then guarantees
+  single-run convergence to "no payload rows without matching encodings"
+  (r3-A). Cancellation keeps committed batches; the in-flight batch rolls
+  back whole. Then orphan `blobs`, then unreferenced `dicts`. See
+  [GUARANTEES.md](GUARANTEES.md).
 - `iter_live_content()` is **weakly consistent but monotone-safe for GC
   staging** (C3): it pages 1000 rows per short read transaction, so a page
   boundary can capture late additions in a later page and retain refs deleted
